@@ -133,29 +133,15 @@ function toggleFolder(path: string) {
 
 /**
  * 播放曲目
- * 如果是本地文件且不在播放列表中，则先添加到列表
+ * 直接播放文件夹树中的文件，不添加到播放列表
  */
 async function playTrack(track: any) {
-    // Add track to playlist if not exists
-    const path = track.source.Local;
-    // Normalize path for comparison (handle different path separators)
-    const normalizePath = (p: string) => p.replace(/\\/g, '/').toLowerCase();
-    const normalizedPath = normalizePath(path);
-    const exists = store.playlist.some((t: any) =>
-        t.source.Local && normalizePath(t.source.Local) === normalizedPath
-    );
-
-    if (!exists) {
-        await invoke('add_local_files', { paths: [path] });
-        await store.loadPlaylist();
-    }
-
-    // Find index and play
-    const index = store.playlist.findIndex((t: any) =>
-        t.source.Local && normalizePath(t.source.Local) === normalizedPath
-    );
-    if (index !== -1) {
-        await store.play(index);
+    try {
+        await invoke('play_track_directly', { track });
+        // 同步状态以更新播放状态（isPlaying等）
+        await store.syncState();
+    } catch (err) {
+        console.error('Failed to play track directly:', err);
     }
 }
 
@@ -287,6 +273,7 @@ function clearFolderTree() {
                 @toggle-folder="toggleFolder"
                 @play-track="playTrack"
                 :current-index="store.currentIndex"
+                :current-track="store.currentTrack"
                 :playlist="store.playlist"
             />
         </div>

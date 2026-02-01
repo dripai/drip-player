@@ -33,3 +33,5 @@ doc/
 .claude/
 .trae/
 config/
+src-tauri/config/
+src-tauri/lib/

@@ -13,7 +13,7 @@ use models::playlist::{MediaType, TrackSource, Track, PlaylistItem};
 use services::online_resolver::{OnlineResolver, VideoPlatform};
 use services::persistence::PersistenceManager;
 use std::sync::{Arc, Mutex};
-use tauri::{State, AppHandle, Window, Emitter, Manager, menu::{Menu, MenuItem, ContextMenu}};
+use tauri::{State, AppHandle, Window, Emitter, Manager, menu::{Menu, MenuItem, ContextMenu, CheckMenuItem}, tray::{TrayIconBuilder, TrayIconEvent, MouseButton}};
 use std::time::{Duration, Instant};
 use std::process::Command;
 use tauri_plugin_dialog::DialogExt;
@@ -27,7 +27,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Create a Command that hides the console window on Windows
+/// 创建一个在 Windows 上隐藏控制台窗口的命令
 #[cfg(windows)]
 fn hidden_command(program: &str) -> Command {
     let mut cmd = Command::new(program);
@@ -43,6 +43,7 @@ fn hidden_command(program: &str) -> Command {
 #[derive(Clone)]
 struct AppState(Arc<Mutex<MusicPlayer>>);
 
+/// 使用 ffprobe 获取媒体文件时长
 fn get_duration_with_ffprobe(path: &Path) -> Option<Duration> {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let lib_dir = current_dir.join("lib");
@@ -75,7 +76,7 @@ fn get_duration_with_ffprobe(path: &Path) -> Option<Duration> {
     }
 }
 
-/// Get cache directory in executable's directory
+/// 获取可执行文件目录中的缓存目录
 fn get_cache_dir() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
@@ -84,7 +85,7 @@ fn get_cache_dir() -> std::path::PathBuf {
         .join("cache")
 }
 
-/// Get download temp directory
+/// 获取下载临时目录
 fn get_download_dir() -> std::path::PathBuf {
     get_cache_dir().join("downloading")
 }
@@ -96,25 +97,42 @@ impl Deref for AppState {
     }
 }
 
+/// 比较两个路径是否相同（在 Windows 上忽略大小写）
+fn paths_match(p1: &Path, p2: &Path) -> bool {
+    if p1 == p2 {
+        return true;
+    }
+    
+    #[cfg(windows)]
+    {
+        return p1.to_string_lossy().to_lowercase() == p2.to_string_lossy().to_lowercase();
+    }
+
+    #[cfg(not(windows))]
+    false
+}
+
+/// 获取播放列表
 #[tauri::command]
 fn get_playlist(state: State<AppState>) -> Vec<Track> {
     let player = state.0.lock().unwrap();
     player.playlist.tracks.clone()
 }
 
+/// 获取播放器状态（播放/暂停、进度、时长、当前曲目）
 #[tauri::command]
 fn get_state(state: State<AppState>) -> PlayerState {
     let mut player = state.0.lock().unwrap();
 
-    // Calculate current progress dynamically
+    // 动态计算当前进度
     if player.is_playing {
         if let Some(start) = player.playback_start {
             let elapsed = start.elapsed();
             let total_elapsed = player.playback_offset + elapsed;
 
-            // Get duration based on media type
+            // 根据媒体类型获取时长
             let duration = match player.current_media_type {
-                Some(MediaType::Video) => player.duration, // Use stored duration for video
+                Some(MediaType::Video) => player.duration, // 视频使用存储的时长
                 _ => {
                     let d = player.audio.get_duration();
                     if d.as_secs_f32() > 0.0 {
@@ -130,7 +148,7 @@ fn get_state(state: State<AppState>) -> PlayerState {
             }
         }
     } else {
-        // If paused, just use stored offset
+        // 如果暂停，仅使用存储的偏移量
         let duration = match player.current_media_type {
             Some(MediaType::Video) => player.duration,
             _ => {
@@ -147,7 +165,11 @@ fn get_state(state: State<AppState>) -> PlayerState {
         }
     }
 
-    let current_track = player.playlist.current_track().cloned();
+    let current_track = if let Some(index) = player.playlist.current_index {
+        player.playlist.tracks.get(index).cloned()
+    } else {
+        player.temporary_track.clone()
+    };
     PlayerState {
         is_playing: player.is_playing,
         progress: player.progress,
@@ -157,20 +179,22 @@ fn get_state(state: State<AppState>) -> PlayerState {
     }
 }
 
+/// 播放指定索引的曲目
 #[tauri::command]
 async fn play_track(index: usize, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut player = state.0.lock().unwrap();
     
-    // Stop existing
+    // 停止现有的播放
     player.audio.stop();
     if let Some(mut child) = player.video_process.take() {
         let _ = child.kill();
     }
     
-    // Reset playback state
+    // 重置播放状态
     player.playback_start = None;
     player.playback_offset = Duration::from_secs(0);
     player.progress = 0.0;
+    player.temporary_track = None; // 清除临时曲目
 
     if index >= player.playlist.tracks.len() {
         return Err("Index out of bounds".into());
@@ -179,13 +203,13 @@ async fn play_track(index: usize, state: State<'_, AppState>, app_handle: AppHan
     player.playlist.current_index = Some(index);
     let track = player.playlist.tracks[index].clone();
 
-    // Determine path and type
+    // 确定路径和类型
     let (path, media_type) = match &track.source {
         TrackSource::Local(p) => {
             let mt = if let Some(ext) = p.extension() {
                 let s = ext.to_string_lossy().to_lowercase();
-                // Only mp4/webm as video (browser supported)
-                // mkv/avi/mov will be played as audio (extract audio track via ffmpeg)
+                // 仅将 mp4/webm 视为视频（浏览器支持）
+                // mkv/avi/mov 将作为音频播放（通过 ffmpeg 提取音频轨道）
                 if ["mp4", "webm"].contains(&s.as_str()) {
                     MediaType::Video
                 } else {
@@ -200,7 +224,7 @@ async fn play_track(index: usize, state: State<'_, AppState>, app_handle: AppHan
             if let Some(p) = cached_path {
                 (Some(p.clone()), media_type.clone())
             } else {
-                // Use URL as path for backend playback
+                // 使用 URL 作为后端播放的路径
                 (Some(std::path::PathBuf::from(url)), media_type.clone())
             }
         }
@@ -209,53 +233,53 @@ async fn play_track(index: usize, state: State<'_, AppState>, app_handle: AppHan
     player.current_media_type = Some(media_type.clone());
 
     if media_type == MediaType::Video {
-        // Video handled by frontend - just update state
+        // 视频由前端处理 - 仅更新状态
         player.is_playing = true;
         player.current_media_path = path.clone();
         player.playback_start = Some(Instant::now());
 
-        // Get duration using ffprobe for video files
+        // 使用 ffprobe 获取视频文件的时长
         if let Some(ref p) = path {
             if let Some(duration) = get_duration_with_ffprobe(p) {
                 player.duration = duration;
             }
         }
     } else {
-        // Audio handled by backend
+        // 音频由后端处理
         if let Some(p) = path {
             player.current_media_path = Some(p.clone());
             let rx = player.audio.play_file(p);
             player.is_playing = true;
-            // Record start time
+            // 记录开始时间
             player.playback_start = Some(Instant::now());
 
-            // Handle result asynchronously to check for timeout/errors
+            // 异步处理结果以检查超时/错误
             let app_handle_clone = app_handle.clone();
             let player_clone = state.0.clone();
             
             tauri::async_runtime::spawn(async move {
                 match rx.recv() {
                     Ok(Ok(_)) => {
-                        // Success
+                        // 成功
                     },
                     Ok(Err(e)) => {
                         println!("Playback error: {}", e);
-                        // Update state to stopped
+                        // 更新状态为停止
                         let mut player = player_clone.lock().unwrap();
                         player.is_playing = false;
                         player.playback_start = None;
-                        drop(player); // Release lock
+                        drop(player); // 释放锁
                         
                         let _ = app_handle_clone.emit("playback-error", e);
                         let _ = app_handle_clone.emit("player-state-changed", ());
                     },
                     Err(_) => {
-                        // Channel closed unexpectedly
+                        // 通道意外关闭
                     }
                 }
             });
         } else {
-             // Should not happen with above logic
+             // 应该不会发生，基于上述逻辑
              player.is_playing = true;
              player.current_media_path = None;
         }
@@ -265,13 +289,120 @@ async fn play_track(index: usize, state: State<'_, AppState>, app_handle: AppHan
     Ok(())
 }
 
+/// 直接播放曲目（不加入播放列表）
+#[tauri::command]
+async fn play_track_directly(track: Track, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
+    let mut player = state.0.lock().unwrap();
+    
+    // 停止现有的播放
+    player.audio.stop();
+    if let Some(mut child) = player.video_process.take() {
+        let _ = child.kill();
+    }
+    
+    // 重置播放状态
+    player.playback_start = None;
+    player.playback_offset = Duration::from_secs(0);
+    player.progress = 0.0;
+    
+    // 设置临时曲目并清除当前列表索引
+    player.playlist.current_index = None;
+    player.temporary_track = Some(track.clone());
+
+    // 确定路径和类型
+    let (path, media_type) = match &track.source {
+        TrackSource::Local(p) => {
+            let mt = if let Some(ext) = p.extension() {
+                let s = ext.to_string_lossy().to_lowercase();
+                // 仅将 mp4/webm 视为视频（浏览器支持）
+                // mkv/avi/mov 将作为音频播放（通过 ffmpeg 提取音频轨道）
+                if ["mp4", "webm"].contains(&s.as_str()) {
+                    MediaType::Video
+                } else {
+                    MediaType::Audio
+                }
+            } else {
+                MediaType::Audio
+            };
+            (Some(p.clone()), mt)
+        },
+        TrackSource::Remote { cached_path, media_type, url, .. } => {
+            if let Some(p) = cached_path {
+                (Some(p.clone()), media_type.clone())
+            } else {
+                // 使用 URL 作为后端播放的路径
+                (Some(std::path::PathBuf::from(url)), media_type.clone())
+            }
+        }
+    };
+
+    player.current_media_type = Some(media_type.clone());
+
+    if media_type == MediaType::Video {
+        // 视频由前端处理 - 仅更新状态
+        player.is_playing = true;
+        player.current_media_path = path.clone();
+        player.playback_start = Some(Instant::now());
+
+        // 使用 ffprobe 获取视频文件的时长
+        if let Some(ref p) = path {
+            if let Some(duration) = get_duration_with_ffprobe(p) {
+                player.duration = duration;
+            }
+        }
+    } else {
+        // 音频由后端处理
+        if let Some(p) = path {
+            player.current_media_path = Some(p.clone());
+            let rx = player.audio.play_file(p);
+            player.is_playing = true;
+            // 记录开始时间
+            player.playback_start = Some(Instant::now());
+
+            // 异步处理结果以检查超时/错误
+            let app_handle_clone = app_handle.clone();
+            let player_clone = state.0.clone();
+            
+            tauri::async_runtime::spawn(async move {
+                match rx.recv() {
+                    Ok(Ok(_)) => {
+                        // 成功
+                    },
+                    Ok(Err(e)) => {
+                        println!("Playback error: {}", e);
+                        // 更新状态为停止
+                        let mut player = player_clone.lock().unwrap();
+                        player.is_playing = false;
+                        player.playback_start = None;
+                        drop(player); // 释放锁
+                        
+                        let _ = app_handle_clone.emit("playback-error", e);
+                        let _ = app_handle_clone.emit("player-state-changed", ());
+                    },
+                    Err(_) => {
+                        // 通道意外关闭
+                    }
+                }
+            });
+        } else {
+             // 应该不会发生，基于上述逻辑
+             player.is_playing = true;
+             player.current_media_path = None;
+        }
+    }
+    
+    app_handle.emit("player-state-changed", ()).unwrap();
+    Ok(())
+}
+
+/// 暂停播放
 #[tauri::command]
 fn pause(state: State<AppState>, app_handle: AppHandle) {
     let mut player = state.0.lock().unwrap();
     player.audio.pause();
     player.is_playing = false;
     
-    // Update offset
+    // 更新偏移量
     if let Some(start) = player.playback_start {
         player.playback_offset += start.elapsed();
         player.playback_start = None;
@@ -280,6 +411,7 @@ fn pause(state: State<AppState>, app_handle: AppHandle) {
     app_handle.emit("player-state-changed", ()).unwrap();
 }
 
+/// 恢复播放
 #[tauri::command]
 fn resume(state: State<AppState>, app_handle: AppHandle) {
     let mut player = state.0.lock().unwrap();
@@ -289,19 +421,20 @@ fn resume(state: State<AppState>, app_handle: AppHandle) {
     player.audio.resume();
     player.is_playing = true;
     
-    // Start tracking again
+    // 重新开始追踪
     player.playback_start = Some(Instant::now());
     
     app_handle.emit("player-state-changed", ()).unwrap();
 }
 
+/// 跳转到指定进度 (0.0 - 1.0)
 #[tauri::command]
 fn seek(progress: f32, state: State<AppState>) {
     let mut player = state.0.lock().unwrap();
     let duration = player.duration;
     let seek_time = Duration::from_secs_f32(duration.as_secs_f32() * progress);
 
-    // Update progress tracking for all media types
+    // 更新所有媒体类型的进度追踪
     player.playback_offset = seek_time;
     player.progress = progress;
     if player.is_playing {
@@ -310,12 +443,13 @@ fn seek(progress: f32, state: State<AppState>) {
         player.playback_start = None;
     }
 
-    // For audio, also seek in the backend
+    // 对于音频，也在后端进行 seek
     if let Some(MediaType::Audio) = player.current_media_type {
         player.audio.seek(seek_time);
     }
 }
 
+/// 设置音量 (0.0 - 1.0)
 #[tauri::command]
 fn set_volume(volume: f32, state: State<AppState>) {
     let mut player = state.0.lock().unwrap();
@@ -330,12 +464,12 @@ async fn add_local_files(paths: Vec<String>, state: State<'_, AppState>, app_han
     
     for path_str in paths {
         let path = std::path::PathBuf::from(path_str);
-        // Basic validation
+        // 基本验证
         if path.exists() {
-             // Check if already exists
+             // 检查是否存在
              let exists = player.playlist.tracks.iter().any(|t| {
                  match &t.source {
-                     TrackSource::Local(p) => p.as_path() == path.as_path(),
+                     TrackSource::Local(p) => paths_match(p, &path),
                      _ => false
                  }
              });
@@ -354,6 +488,7 @@ async fn add_local_files(paths: Vec<String>, state: State<'_, AppState>, app_han
     Ok(())
 }
 
+/// 打开文件选择对话框并添加本地文件
 #[tauri::command]
 async fn pick_and_add_local_files(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let file_paths = app_handle.dialog().file()
@@ -373,7 +508,7 @@ async fn pick_and_add_local_files(app_handle: AppHandle, state: State<'_, AppSta
             if path_buf.exists() {
                  let exists = player.playlist.tracks.iter().any(|t| {
                      match &t.source {
-                         TrackSource::Local(p) => p.as_path() == path_buf.as_path(),
+                         TrackSource::Local(p) => paths_match(p, &path_buf),
                          _ => false
                      }
                  });
@@ -394,6 +529,7 @@ async fn pick_and_add_local_files(app_handle: AppHandle, state: State<'_, AppSta
     Ok(())
 }
 
+/// 打开文件夹选择对话框并递归添加媒体文件
 #[tauri::command]
 async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let folder_path = app_handle.dialog().file()
@@ -405,7 +541,7 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
             Err(_) => return Err("Failed to get folder path".into()),
         };
 
-        // Scan folder recursively and build tree structure
+        // 递归扫描文件夹并构建树形结构
         let media_extensions = ["mp3", "wav", "ogg", "flac", "m4a", "aac", "mp4", "mkv", "webm", "avi", "mov"];
 
         fn scan_directory_tree(dir: &std::path::Path, extensions: &[&str]) -> Option<PlaylistItem> {
@@ -414,7 +550,7 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
 
             if let Ok(entries) = std::fs::read_dir(dir) {
                 let mut entries: Vec<_> = entries.flatten().collect();
-                // Sort: folders first, then files
+                // 排序: 文件夹优先，然后是文件
                 entries.sort_by_key(|e| {
                     let path = e.path();
                     (!path.is_dir(), path.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
@@ -449,7 +585,7 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
         }
 
         if let Some(folder_item) = scan_directory_tree(&folder_buf, &media_extensions) {
-            // Flatten the tree to add tracks to playlist
+            // 扁平化树以添加曲目到播放列表
             fn flatten_items(item: &PlaylistItem, tracks: &mut Vec<Track>) {
                 match item {
                     PlaylistItem::Track(track) => tracks.push(track.clone()),
@@ -468,7 +604,7 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
                 return Err("No media files found in the selected folder".into());
             }
 
-            // Add tracks to playlist
+            // 添加曲目到播放列表
             let mut player = state.0.lock().unwrap();
             let mut added = false;
 
@@ -480,7 +616,7 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
 
                 let exists = player.playlist.tracks.iter().any(|t| {
                     match &t.source {
-                        TrackSource::Local(p) => p.as_path() == path.as_path(),
+                        TrackSource::Local(p) => paths_match(p, path),
                         _ => false
                     }
                 });
@@ -503,6 +639,7 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
     Ok(())
 }
 
+/// 获取文件夹树结构
 #[tauri::command]
 fn get_folder_tree(folder_path: String) -> Result<PlaylistItem, String> {
     let path = std::path::PathBuf::from(folder_path);
@@ -551,12 +688,13 @@ fn get_folder_tree(folder_path: String) -> Result<PlaylistItem, String> {
         .ok_or_else(|| "No media files found".to_string())
 }
 
+/// 添加 URL 进行下载解析
 #[tauri::command]
 async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
-    // Clean URL (remove trailing characters like :)
+    // 清理 URL (移除尾部的字符，如 :)
     let url = url.trim().trim_end_matches(':').to_string();
 
-    // Check for duplicates first (quick check)
+    // 首先检查重复项 (快速检查)
     {
         let player = state.0.lock().unwrap();
         let exists = player.playlist.tracks.iter().any(|t| {
@@ -566,20 +704,20 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
             }
         });
         if exists {
-            return Ok(()); // Already exists, skip
+            return Ok(()); // 已存在，跳过
         }
     }
 
-    // Emit loading state
+    // 发送加载状态
     app_handle.emit("url-resolving", true).unwrap();
 
-    // Resolve metadata in background thread to avoid blocking UI
+    // 在后台线程中解析元数据以避免阻塞 UI
     let url_clone = url.clone();
     let metadata_result = tauri::async_runtime::spawn_blocking(move || {
         OnlineResolver::resolve_metadata(&url_clone)
     }).await.map_err(|e| format!("Task failed: {}", e))?;
 
-    // Emit loading done
+    // 发送加载完成
     app_handle.emit("url-resolving", false).unwrap();
 
     let (title, duration, id, media_type) = match metadata_result {
@@ -597,11 +735,11 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
         }
     };
 
-    // Add to playlist WITHOUT downloading - user must double-click to download
+    // 添加到播放列表但不下载 - 用户必须双击下载
     let added = {
         let mut player = state.0.lock().unwrap();
 
-        // Double check for duplicates (in case added while resolving)
+        // 再次检查重复项 (防止在解析时已添加)
         let exists = player.playlist.tracks.iter().any(|t| {
             match &t.source {
                 TrackSource::Remote { url: u, .. } => u == &url,
@@ -631,9 +769,10 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
     Ok(())
 }
 
+/// 下载并播放指定索引的曲目
 #[tauri::command]
 async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
-    // Get track info and check if already downloading
+    // 获取曲目信息并检查是否正在下载
     let (url, id, title, media_type, already_cached, is_downloading) = {
         let player = state.0.lock().unwrap();
         if index >= player.playlist.tracks.len() {
@@ -643,7 +782,7 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
         let track = &player.playlist.tracks[index];
         match &track.source {
             TrackSource::Remote { url, id, title, media_type, cached_path, is_downloading, .. } => {
-                // Check if already downloaded
+                // 检查是否已下载
                 let cached = if let Some(path) = cached_path {
                     path.exists()
                 } else {
@@ -652,23 +791,23 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
                 (url.clone(), id.clone(), title.clone(), media_type.clone(), cached, *is_downloading)
             },
             TrackSource::Local(_) => {
-                // Local file, play directly
+                // 本地文件，直接播放
                 return Err("This is a local file, use play_track instead".into());
             }
         }
-    }; // Lock dropped here
+    }; // 锁在这里释放
 
-    // If already cached, play directly
+    // 如果已缓存，直接播放
     if already_cached {
         return play_track(index, state, app_handle).await;
     }
 
-    // If already downloading, return error
+    // 如果正在下载，返回错误
     if is_downloading {
         return Err("Already downloading".into());
     }
 
-    // Mark as downloading
+    // 标记为正在下载
     {
         let mut player = state.0.lock().unwrap();
         if let Some(track) = player.playlist.tracks.get_mut(index) {
@@ -679,11 +818,11 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
     }
     app_handle.emit("playlist-updated", ()).unwrap();
 
-    // Download to temp directory first
+    // 首先下载到临时目录
     let download_dir = get_download_dir();
     let cache_dir = get_cache_dir();
 
-    // Ensure directories exist
+    // 确保目录存在
     if !download_dir.exists() {
         std::fs::create_dir_all(&download_dir).map_err(|e| format!("Failed to create download dir: {}", e))?;
     }
@@ -698,7 +837,7 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
     let id_clone = id.clone();
     let download_dir_clone = download_dir.clone();
 
-    // Download in a blocking task to not block the async runtime
+    // 在阻塞任务中下载，以免阻塞异步运行时
     let download_result = tokio::task::spawn_blocking(move || {
         OnlineResolver::download_media(
             &url_clone,
@@ -714,32 +853,32 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
 
     match download_result {
         Ok(temp_path) => {
-            // Move file from download dir to cache dir
+            // 将文件从下载目录移动到缓存目录
             let file_name = temp_path.file_name().unwrap_or_default();
             let final_path = cache_dir.join(file_name);
 
-            // Remove existing file if exists
+            // 如果存在则删除现有文件
             if final_path.exists() {
                 let _ = std::fs::remove_file(&final_path);
             }
 
-            // Move file
+            // 移动文件
             std::fs::rename(&temp_path, &final_path)
                 .or_else(|_| {
-                    // If rename fails (cross-device), try copy + delete
+                    // 如果重命名失败（跨设备），尝试复制+删除
                     std::fs::copy(&temp_path, &final_path)?;
                     std::fs::remove_file(&temp_path)
                 })
                 .map_err(|e| format!("Failed to move file: {}", e))?;
 
-            // Move subtitle files (if any) from download dir to cache dir
+            // 将字幕文件（如果有）从下载目录移动到缓存目录
             if let Ok(entries) = std::fs::read_dir(&download_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(name) = path.file_name() {
                             let name_str = name.to_string_lossy();
-                            // Check if it's a subtitle file for this video
+                            // 检查是否为该视频的字幕文件
                             if name_str.starts_with(&format!("{}.", id)) &&
                                (name_str.ends_with(".srt") ||
                                 name_str.ends_with(".vtt") ||
@@ -757,7 +896,7 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
                 }
             }
 
-            // Update track with cached path and new title (filename)
+            // 更新曲目的缓存路径和新标题（文件名）
             {
                 let mut player = state_clone.lock().unwrap();
                 if let Some(track) = player.playlist.tracks.get_mut(index_clone) {
@@ -765,7 +904,7 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
                         println!("Updating track state: cached_path={:?}, is_downloading=false", final_path);
                         *cached_path = Some(final_path.clone());
                         *is_downloading = false;
-                        // Update title to filename (without extension)
+                        // 更新标题为文件名（不含扩展名）
                         if let Some(stem) = final_path.file_stem() {
                             *title = stem.to_string_lossy().to_string();
                         }
@@ -780,11 +919,11 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
             println!("Emitting playlist-updated event");
             app_handle.emit("playlist-updated", ()).unwrap();
 
-            // Now play the downloaded file
+            // 现在播放已下载的文件
             play_track(index, state, app_handle).await
         },
         Err(e) => {
-            // Reset downloading state on error
+            // 出错时重置下载状态
             {
                 let mut player = state_clone.lock().unwrap();
                 if let Some(track) = player.playlist.tracks.get_mut(index_clone) {
@@ -799,11 +938,12 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
     }
 }
 
+/// 播放出错时的处理 (尝试使用后端播放器)
 #[tauri::command]
 async fn on_playback_error(state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     println!("Frontend playback failed");
 
-    // Get current track info
+    // 获取当前曲目信息
     let (url_or_path, is_video) = {
         let player = state.0.lock().unwrap();
 
@@ -830,10 +970,10 @@ async fn on_playback_error(state: State<'_, AppState>, app_handle: AppHandle) ->
         }
     };
 
-    // Only use ffplay for audio files or as last resort for video
-    // For video, the frontend video player should handle it
+    // 仅对音频文件使用 ffplay，或作为视频的最后手段
+    // 对于视频，前端视频播放器应该处理它
     if !is_video {
-        // Try backend audio player for audio files
+        // 尝试使用后端音频播放器播放音频文件
         if let Some(ffplay) = OnlineResolver::get_ffplay_path() {
             let play_target = if url_or_path.starts_with("http") {
                 println!("Attempting to resolve stream URL for backend playback...");
@@ -861,7 +1001,7 @@ async fn on_playback_error(state: State<'_, AppState>, app_handle: AppHandle) ->
 
             if play_target.starts_with("http") {
                 cmd.arg("-headers");
-                // Add platform-specific referer based on original URL
+                // 根据原始 URL 添加特定于平台的引用页
                 let platform = VideoPlatform::from_url(&url_or_path);
                 if let Some(referer) = platform.get_referer() {
                     cmd.arg(format!("Referer: {}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n", referer));
@@ -879,7 +1019,7 @@ async fn on_playback_error(state: State<'_, AppState>, app_handle: AppHandle) ->
             match child_result {
                 Ok(c) => {
                     let mut player = state.0.lock().unwrap();
-                    // Kill existing process if any
+                    // 如果有现有进程，则杀死它
                     if let Some(mut child) = player.video_process.take() {
                         let _ = child.kill();
                     }
@@ -906,6 +1046,7 @@ async fn on_playback_error(state: State<'_, AppState>, app_handle: AppHandle) ->
     Ok(())
 }
 
+/// 显示曲目上下文菜单
 #[tauri::command]
 async fn show_track_context_menu(window: Window, index: usize, locale: String) -> Result<(), String> {
     let app_handle = window.app_handle().clone();
@@ -933,6 +1074,7 @@ async fn show_track_context_menu(window: Window, index: usize, locale: String) -
     Ok(())
 }
 
+/// 显示播放列表上下文菜单
 #[tauri::command]
 async fn show_playlist_context_menu(window: Window, locale: String) -> Result<(), String> {
     let app_handle = window.app_handle().clone();
@@ -968,6 +1110,7 @@ async fn show_playlist_context_menu(window: Window, locale: String) -> Result<()
     Ok(())
 }
 
+/// 移除指定索引的曲目
 #[tauri::command]
 async fn remove_track(index: usize, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut player = state.0.lock().unwrap();
@@ -978,15 +1121,15 @@ async fn remove_track(index: usize, state: State<'_, AppState>, app_handle: AppH
 
     player.playlist.tracks.remove(index);
 
-    // Adjust current index if needed
+    // 如果需要，调整当前索引
     if let Some(current) = player.playlist.current_index {
         if current == index {
-            // Removed currently playing track
+            // 移除了当前正在播放的曲目
             player.playlist.current_index = None;
             player.is_playing = false;
             player.audio.stop();
         } else if current > index {
-            // Adjust index if removed track was before current
+            // 如果移除的曲目在当前曲目之前，则调整索引
             player.playlist.current_index = Some(current - 1);
         }
     }
@@ -996,6 +1139,7 @@ async fn remove_track(index: usize, state: State<'_, AppState>, app_handle: AppH
     Ok(())
 }
 
+/// 清空播放列表
 #[tauri::command]
 async fn clear_playlist(state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut player = state.0.lock().unwrap();
@@ -1014,6 +1158,7 @@ async fn clear_playlist(state: State<'_, AppState>, app_handle: AppHandle) -> Re
     Ok(())
 }
 
+/// 检查外部依赖 (yt-dlp, ffmpeg, ffplay)
 #[tauri::command]
 fn check_dependencies() -> Result<serde_json::Value, String> {
     use crate::services::online_resolver::OnlineResolver;
@@ -1022,14 +1167,14 @@ fn check_dependencies() -> Result<serde_json::Value, String> {
     let (yt_dlp_cmd, ffmpeg_dir) = OnlineResolver::get_tools_paths();
     let ffplay_path = OnlineResolver::get_ffplay_path();
 
-    // Check yt-dlp
+    // 检查 yt-dlp
     let yt_dlp_available = hidden_command(&yt_dlp_cmd)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    // Check ffmpeg
+    // 检查 ffmpeg
     let ffmpeg_available = if let Some(dir) = ffmpeg_dir {
         let ffmpeg_exe = std::path::PathBuf::from(&dir).join("ffmpeg.exe");
         ffmpeg_exe.exists()
@@ -1041,7 +1186,7 @@ fn check_dependencies() -> Result<serde_json::Value, String> {
             .unwrap_or(false)
     };
 
-    // Check ffplay
+    // 检查 ffplay
     let ffplay_available = ffplay_path.is_some();
 
     Ok(json!({
@@ -1062,6 +1207,7 @@ fn check_dependencies() -> Result<serde_json::Value, String> {
     }))
 }
 
+/// 获取视频文件的 URL (本地路径转换)
 #[tauri::command]
 fn get_video_url(path: String) -> Result<String, String> {
     let path_buf = std::path::PathBuf::from(&path);
@@ -1070,10 +1216,11 @@ fn get_video_url(path: String) -> Result<String, String> {
         return Err(format!("File not found: {}", path));
     }
 
-    // Return the path as-is, convertFileSrc will handle it on the frontend
+    // 原样返回路径，前端的 convertFileSrc 会处理它
     Ok(path)
 }
 
+/// 播放网络视频 (解析流地址)
 #[tauri::command]
 async fn play_online_video(window: Window, url: String) -> Result<(), String> {
     let platform = VideoPlatform::from_url(&url);
@@ -1084,30 +1231,32 @@ async fn play_online_video(window: Window, url: String) -> Result<(), String> {
 
     println!("Resolved video URL: {}", video_url);
 
-    // Emit to frontend
+    // 发送到前端
     window.emit("online_video_url", video_url)
         .map_err(|e| format!("Failed to emit event: {}", e))?;
 
     Ok(())
 }
 
-// Keep old name for backward compatibility
+// 保持旧名称以向后兼容
+/// 播放 Bilibili 视频 (兼容接口)
 #[tauri::command]
 async fn play_bilibili_video(window: Window, url: String) -> Result<(), String> {
     play_online_video(window, url).await
 }
 
+/// 使用外部 MPV 播放器播放
 #[tauri::command]
 async fn play_with_mpv(path: String, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     println!("Playing with MPV: {}", path);
 
-    // Get MPV path
+    // 获取 MPV 路径
     let mpv_path = OnlineResolver::get_mpv_path()
         .ok_or_else(|| "MPV not found. Please install MPV or place mpv.exe in the lib folder.".to_string())?;
 
     println!("Using MPV: {}", mpv_path);
 
-    // Kill existing video process
+    // 杀死现有的视频进程
     {
         let mut player = state.0.lock().unwrap();
         if let Some(mut child) = player.video_process.take() {
@@ -1115,7 +1264,7 @@ async fn play_with_mpv(path: String, state: State<'_, AppState>, app_handle: App
         }
     }
 
-    // Spawn MPV process
+    // 启动 MPV 进程
     let child = Command::new(&mpv_path)
         .arg(&path)
         .arg("--force-window=yes")
@@ -1124,7 +1273,7 @@ async fn play_with_mpv(path: String, state: State<'_, AppState>, app_handle: App
         .spawn()
         .map_err(|e| format!("Failed to start MPV: {}", e))?;
 
-    // Store process and update state
+    // 存储进程并更新状态
     {
         let mut player = state.0.lock().unwrap();
         player.video_process = Some(child);
@@ -1136,12 +1285,13 @@ async fn play_with_mpv(path: String, state: State<'_, AppState>, app_handle: App
     Ok(())
 }
 
+/// 检查 MPV 是否可用
 #[tauri::command]
 fn check_mpv_available() -> bool {
     OnlineResolver::get_mpv_path().is_some()
 }
 
-/// Open the login page for a platform in the default browser
+/// 在默认浏览器中打开平台的登录页面
 #[tauri::command]
 async fn open_platform_login(platform: String) -> Result<String, String> {
     let login_url = match platform.to_lowercase().as_str() {
@@ -1153,7 +1303,7 @@ async fn open_platform_login(platform: String) -> Result<String, String> {
         _ => return Err(format!("Unknown platform: {}", platform)),
     };
 
-    // Open in default browser
+    // 在默认浏览器中打开
     #[cfg(target_os = "windows")]
     {
         Command::new("cmd")
@@ -1181,7 +1331,7 @@ async fn open_platform_login(platform: String) -> Result<String, String> {
     Ok(login_url.to_string())
 }
 
-/// Check if an error indicates login is required and return login info
+/// 检查错误是否指示需要登录，并返回登录信息
 #[tauri::command]
 fn check_login_required(error: String) -> Option<LoginRequiredInfo> {
     if let Some((platform, login_url, message)) = OnlineResolver::parse_login_error(&error) {
@@ -1202,13 +1352,13 @@ struct LoginRequiredInfo {
     message: String,
 }
 
-/// Try to add URL using OAuth2 authentication (for YouTube)
-/// This will trigger browser-based OAuth flow
+/// 尝试使用 OAuth2 认证添加 URL (针对 YouTube)
+/// 这将触发基于浏览器的 OAuth 流程
 #[tauri::command]
 async fn add_url_with_oauth(url: String, window: Window) -> Result<(), String> {
     println!("Attempting to add URL with OAuth2: {}", url);
 
-    // Emit resolving state
+    // 发送解析状态
     window.emit("url-resolving", true).ok();
 
     let url_clone = url.clone();
@@ -1221,9 +1371,9 @@ async fn add_url_with_oauth(url: String, window: Window) -> Result<(), String> {
     match result {
         Ok(metadata) => {
             println!("OAuth2 resolved: {} ({})", metadata.title, metadata.id);
-            // Now add to playlist using the regular flow
-            // We need to call add_url_for_download logic here
-            // For now, emit success and let frontend retry with normal flow
+            // 现在使用常规流程添加到播放列表
+            // 我们需要在这里调用 add_url_for_download 逻辑
+            // 目前，发送成功信号并让前端使用正常流程重试
             window.emit("oauth-success", &url).ok();
             Ok(())
         }
@@ -1240,12 +1390,13 @@ struct SubtitleInfo {
     path: String,
 }
 
+/// 扫描视频文件的字幕
 #[tauri::command]
 fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
     let video_path = std::path::Path::new(&video_path);
     let mut subtitles = Vec::new();
 
-    // Get the directory and file stem of the video
+    // 获取视频的目录和文件名 (不含扩展名)
     let parent = match video_path.parent() {
         Some(p) => p,
         None => return subtitles,
@@ -1256,7 +1407,7 @@ fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
         None => return subtitles,
     };
 
-    // Scan for subtitle files with same stem
+    // 扫描具有相同文件名的字幕文件
     let subtitle_extensions = ["srt", "vtt", "ass", "ssa"];
 
     if let Ok(entries) = std::fs::read_dir(parent) {
@@ -1267,16 +1418,16 @@ fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
                     let ext_str = ext.to_string_lossy().to_lowercase();
                     if subtitle_extensions.contains(&ext_str.as_str()) {
                         let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-                        // Check if subtitle file matches video stem
-                        // Patterns: stem.lang.ext or stem.ext
+                        // 检查字幕文件是否匹配视频文件名
+                        // 模式: stem.lang.ext 或 stem.ext
                         if file_name.starts_with(&format!("{}.", stem)) {
-                            // Extract language from filename
+                            // 从文件名中提取语言
                             let name_without_ext = path.file_stem().unwrap_or_default().to_string_lossy();
                             let lang = if name_without_ext.len() > stem.len() + 1 {
-                                // Has language code: stem.lang
+                                // 包含语言代码: stem.lang
                                 name_without_ext[stem.len() + 1..].to_string()
                             } else {
-                                // No language code, use extension as identifier
+                                // 没有语言代码，使用扩展名作为标识符
                                 ext_str.to_uppercase()
                             };
 
@@ -1291,7 +1442,7 @@ fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
         }
     }
 
-    // Sort by language
+    // 按语言排序
     subtitles.sort_by(|a, b| a.lang.cmp(&b.lang));
     subtitles
 }
@@ -1299,7 +1450,7 @@ fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
 fn main() {
     let player = Arc::new(Mutex::new(MusicPlayer::new()));
 
-    // Start proxy server
+    // 启动代理服务器
     tauri::async_runtime::spawn(async {
         services::stream_server::start_server(10001).await;
     });
@@ -1309,16 +1460,65 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState(player))
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<AppState>();
+                let player = state.0.lock().unwrap();
+                if player.minimize_to_tray {
+                    api.prevent_close();
+                    window.hide().unwrap();
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             let state = app.state::<AppState>().inner().clone();
             let state_for_menu = state.clone();
 
-            // Menu event handler
+            // 系统托盘配置
+            let initial_minimize_to_tray = state.0.lock().unwrap().minimize_to_tray;
+            let quit_i = MenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
+            let restore_i = MenuItem::with_id(app, "tray_restore", "恢复窗口", true, None::<&str>)?;
+            let minimize_on_close_i = CheckMenuItem::with_id(app, "tray_minimize_on_close", "关闭时最小化", true, initial_minimize_to_tray, None::<&str>)?;
+            
+            let tray_menu = Menu::with_items(app, &[&restore_i, &minimize_on_close_i, &quit_i])?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            // 菜单事件处理
             app.on_menu_event(move |app, event| {
                 let event_id = event.id().as_ref();
 
-                if event_id.starts_with("remove_") {
+                if event_id == "tray_quit" {
+                    app.exit(0);
+                } else if event_id == "tray_restore" {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                } else if event_id == "tray_minimize_on_close" {
+                    let mut player = state_for_menu.0.lock().unwrap();
+                    player.minimize_to_tray = !player.minimize_to_tray;
+                    
+                    // 保存设置
+                    let settings = services::persistence::AppSettings {
+                        minimize_to_tray: player.minimize_to_tray,
+                    };
+                    PersistenceManager::save_settings(&settings);
+                } else if event_id.starts_with("remove_") {
                     if let Some(index_str) = event_id.strip_prefix("remove_") {
                         if let Ok(index) = index_str.parse::<usize>() {
                             let state_clone = state_for_menu.clone();
@@ -1362,7 +1562,7 @@ fn main() {
                 }
             });
 
-            // Move cache scanning to background thread to avoid blocking startup
+            // 将缓存扫描移动到后台线程以避免阻塞启动
             tauri::async_runtime::spawn_blocking(move || {
                 let cached_tracks = PersistenceManager::scan_cache_for_tracks();
                 if !cached_tracks.is_empty() {
@@ -1371,8 +1571,8 @@ fn main() {
                     for track in cached_tracks {
                         let exists = player.playlist.tracks.iter().any(|t| {
                             match (&t.source, &track.source) {
-                                (TrackSource::Local(p1), TrackSource::Local(p2)) => p1 == p2,
-                                (TrackSource::Remote { cached_path: Some(p1), .. }, TrackSource::Local(p2)) => p1 == p2,
+                                (TrackSource::Local(p1), TrackSource::Local(p2)) => paths_match(p1, p2),
+                                (TrackSource::Remote { cached_path: Some(p1), .. }, TrackSource::Local(p2)) => paths_match(p1, p2),
                                  _ => false
                             }
                         });
@@ -1393,6 +1593,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_playlist,
             play_track,
+            play_track_directly,
             pause,
             resume,
             add_url_for_download,

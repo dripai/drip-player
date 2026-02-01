@@ -31,12 +31,19 @@ pub struct MusicPlayer {
     
     pub current_media_path: Option<PathBuf>,
     pub current_media_type: Option<MediaType>,
+    
+    // Track playing directly from tree/file (not in playlist)
+    pub temporary_track: Option<Track>,
+    
+    // Settings
+    pub minimize_to_tray: bool,
 }
 
 impl MusicPlayer {
     pub fn new() -> Self {
         let mut playlist = Playlist::new();
         playlist.tracks = PersistenceManager::load_playlist();
+        let settings = PersistenceManager::load_settings();
 
         // Don't set current_index on startup - let user choose what to play
         // if !playlist.tracks.is_empty() {
@@ -57,6 +64,8 @@ impl MusicPlayer {
             video_process: None,
             current_media_path: None,
             current_media_type: None,
+            temporary_track: None,
+            minimize_to_tray: settings.minimize_to_tray,
         }
     }
 }

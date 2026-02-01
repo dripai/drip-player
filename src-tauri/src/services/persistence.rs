@@ -1,6 +1,12 @@
 use std::fs;
 use std::path::PathBuf;
 use crate::models::playlist::Track;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct AppSettings {
+    pub minimize_to_tray: bool,
+}
 
 pub struct PersistenceManager;
 
@@ -20,6 +26,10 @@ impl PersistenceManager {
 
     fn downloads_path() -> PathBuf {
         Self::config_dir().join("downloads.json")
+    }
+
+    fn settings_path() -> PathBuf {
+        Self::config_dir().join("settings.json")
     }
 
     pub fn ensure_config_dir() {
@@ -65,6 +75,25 @@ impl PersistenceManager {
             }
         }
         Vec::new()
+    }
+
+    pub fn save_settings(settings: &AppSettings) {
+        Self::ensure_config_dir();
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = fs::write(Self::settings_path(), json);
+        }
+    }
+
+    pub fn load_settings() -> AppSettings {
+        let path = Self::settings_path();
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(settings) = serde_json::from_str(&content) {
+                    return settings;
+                }
+            }
+        }
+        AppSettings::default()
     }
 
     pub fn scan_cache_for_tracks() -> Vec<Track> {

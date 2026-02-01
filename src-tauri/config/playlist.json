@@ -1,0 +1,59 @@
+[
+  {
+    "source": {
+      "Local": "D:\\workspace\\12.aiwork\\drip\\drip-music\\cache\\326270.mp4"
+    }
+  },
+  {
+    "source": {
+      "Local": "D:\\workspace\\12.aiwork\\drip\\drip-music\\cache\\BV1eQc2emEwR.mp4"
+    }
+  },
+  {
+    "source": {
+      "Local": "D:\\workspace\\12.aiwork\\drip\\drip-music\\cache\\BV1fY4y1v7na.mp4"
+    }
+  },
+  {
+    "source": {
+      "Local": "D:\\workspace\\12.aiwork\\drip\\drip-music\\cache\\BV1UhWxzhEKZ.mp4"
+    }
+  },
+  {
+    "source": {
+      "Remote": {
+        "url": "https://www.bilibili.com/video/BV18S4y117sN?t=10.1",
+        "id": "BV18S4y117sN",
+        "cached_path": "D:\\workspace\\12.aiwork\\drip\\drip-music\\cache\\BV18S4y117sN.mp4",
+        "title": "BV18S4y117sN",
+        "duration": {
+          "secs": 6420,
+          "nanos": 74000000
+        },
+        "media_type": "Video",
+        "is_downloading": false
+      }
+    }
+  },
+  {
+    "source": {
+      "Remote": {
+        "url": "https://www.bilibili.com/video/BV1PesrzBE5n?t=3.9",
+        "id": "BV1PesrzBE5n",
+        "cached_path": "D:\\workspace\\12.aiwork\\drip\\drip-music\\cache\\BV1PesrzBE5n.mp4",
+        "title": "BV1PesrzBE5n",
+        "duration": {
+          "secs": 9643,
+          "nanos": 167000000
+        },
+        "media_type": "Video",
+        "is_downloading": false
+      }
+    }
+  },
+  {
+    "source": {
+      "Local": "E:\\05.IT\\02.大数据\\07_hive\\Day01\\1_Hive概论.mp4"
+    }
+  }
+]

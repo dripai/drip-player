@@ -58,8 +58,8 @@ npm install -g pnpm
 
 Windows 用户可以在 [GitHub Releases](https://github.com/dripai/drip-player/releases) 下载安装包：
 
-- `drip-player_0.1.0_x64-setup.exe`：推荐普通用户使用。
-- `drip-player_0.1.0_x64_en-US.msi`：适合系统管理或脚本安装。
+- `drip-player_1.0.0_x64-setup.exe`：推荐普通用户使用。
+- `drip-player_1.0.0_x64_en-US.msi`：适合系统管理或脚本安装。
 
 ## 随包工具
 

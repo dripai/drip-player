@@ -182,7 +182,7 @@ cargo check
 发布新版本前，需要在 GitHub Actions secrets 中配置 Tauri updater 签名私钥：
 
 - `TAURI_SIGNING_PRIVATE_KEY`：本地生成的 updater 私钥内容。
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码。如果私钥没有密码，可不配置。
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码。
 
 推送 `v*.*.*` tag 后，GitHub Actions 会构建 Windows 和 macOS 安装包，并生成自动更新所需的签名产物。
 

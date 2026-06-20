@@ -42,7 +42,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdGQUJBODUyQUMzRjRDQTUKUldTbFREK3NVcWlyZjBjaFBabGdIR2hlL0MvNHJOUTR4K0wwY0EzN1dtS1JtOXZGaldBVjZGUFcK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM0N0ZEREExRjQzMzAxMDIKUldRQ0FUUDBvZDEveEdYc3FXSTk0MWdRdlJnNHhlS2x4a0YyQk10cXVROGdVYlJQLzdvZitLblUK",
       "endpoints": [
         "https://github.com/dripai/drip-player/releases/latest/download/latest.json"
       ]

@@ -1,6 +1,6 @@
 [package]
 name = "drip-player"
-version = "1.0.0"
+version = "1.0.1"
 description = "A Tauri desktop media player with probe-first local and online playback."
 authors = ["Drip Player contributors"]
 license = "MIT"

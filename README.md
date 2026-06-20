@@ -7,6 +7,8 @@ Drip Player 是一个基于 Tauri 2、Vue 3 和 Rust 的桌面媒体播放器，
 [![Vue](https://img.shields.io/badge/Vue-3.x-42b883.svg)](https://vuejs.org/)
 [![Rust](https://img.shields.io/badge/Rust-2021-b7410e.svg)](https://www.rust-lang.org/)
 
+![Drip Player 截图](drip-player.png)
+
 ## 功能特性
 
 - 本地媒体库：支持添加单个文件，也支持递归导入整个文件夹。

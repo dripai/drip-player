@@ -24,7 +24,9 @@ src-tauri/gen/
 Thumbs.db
 
 # Project specific
-lib/
+lib/*
+!lib/.gitkeep
+.tool-cache/
 downloads/
 cache/
 *.log

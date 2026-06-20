@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::io::{BufRead, BufReader};
 use crate::models::playlist::MediaType;
+use crate::services::toolchain;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -231,124 +232,22 @@ impl OnlineResolver {
         }
     }
     pub fn get_tools_paths() -> (String, Option<String>) {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let lib_dir = current_dir.join("lib");
-        
-        let yt_dlp_path = lib_dir.join("yt-dlp.exe");
-        let ffmpeg_path = lib_dir.join("ffmpeg.exe");
-        
-        let yt_dlp_cmd = if yt_dlp_path.exists() {
-            yt_dlp_path.to_string_lossy().to_string()
-        } else {
-            "yt-dlp".to_string()
-        };
-        
-        let ffmpeg_cmd = if ffmpeg_path.exists() {
-            Some(lib_dir.to_string_lossy().to_string()) // yt-dlp expects directory or executable for --ffmpeg-location
-        } else {
-            None
-        };
-        
+        let yt_dlp_cmd = toolchain::tool_path("yt-dlp");
+        let ffmpeg_cmd = toolchain::tool_dir_for("ffmpeg")
+            .map(|dir| dir.to_string_lossy().to_string());
         (yt_dlp_cmd, ffmpeg_cmd)
     }
 
     pub fn get_ffplay_path() -> Option<String> {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let lib_dir = current_dir.join("lib");
-        let ffplay_path = lib_dir.join("ffplay.exe");
-
-        if ffplay_path.exists() {
-            Some(ffplay_path.to_string_lossy().to_string())
-        } else {
-            // Check system PATH
-            let in_path = hidden_command("ffplay")
-                .arg("-version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if in_path {
-                Some("ffplay".to_string())
-            } else {
-                None
-            }
-        }
+        toolchain::find_tool("ffplay").map(|path| path.to_string_lossy().to_string())
     }
 
     pub fn get_mpv_path() -> Option<String> {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let lib_dir = current_dir.join("lib");
-        let mpv_path = lib_dir.join("mpv.exe");
-
-        if mpv_path.exists() {
-            Some(mpv_path.to_string_lossy().to_string())
-        } else {
-            // Check system PATH
-            let in_path = hidden_command("mpv")
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if in_path {
-                Some("mpv".to_string())
-            } else {
-                None
-            }
-        }
+        toolchain::find_tool("mpv").map(|path| path.to_string_lossy().to_string())
     }
 
     pub fn get_ffmpeg_path() -> Option<String> {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let lib_dir = current_dir.join("lib");
-        let ffmpeg_path = lib_dir.join("ffmpeg.exe");
-        
-        if ffmpeg_path.exists() {
-            Some(ffmpeg_path.to_string_lossy().to_string())
-        } else {
-            // Check system PATH
-            let in_path = hidden_command("ffmpeg")
-                .arg("-version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if in_path {
-                Some("ffmpeg".to_string())
-            } else {
-                None
-            }
-        }
-    }
-
-    fn is_ffmpeg_available() -> bool {
-        let (yt_dlp_cmd, ffmpeg_path) = Self::get_tools_paths();
-        if let Some(path) = ffmpeg_path {
-            println!("Found ffmpeg in lib: {}", path);
-            return true;
-        }
-        
-        // Derive lib path from yt-dlp path or default to current dir/lib
-        let lib_path = if yt_dlp_cmd == "yt-dlp" {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("lib")
-        } else {
-             Path::new(&yt_dlp_cmd).parent().unwrap_or(Path::new(".")).to_path_buf()
-        };
-
-        // Print message about missing ffmpeg in lib
-        println!("当前路径({}) 未检测到ffmpeg.exe文件", lib_path.display());
-
-        // Check system PATH
-        let in_path = hidden_command("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-            
-        if in_path {
-            println!("Found ffmpeg in system PATH");
-        } else {
-            println!("ffmpeg not found in system PATH either");
-        }
-        
-        in_path
+        toolchain::find_tool("ffmpeg").map(|path| path.to_string_lossy().to_string())
     }
 
     pub fn get_stream_url(url: &str) -> Result<String, String> {
@@ -374,7 +273,7 @@ impl OnlineResolver {
             let mut cmd = hidden_command(&yt_dlp_cmd);
             cmd.args(&[
                 "-g",
-                "-f", "best[ext=mp4]/best", // Prefer mp4, fallback to best
+                "-f", "best[ext=mp4]/best",
                 "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ]);
 
@@ -683,26 +582,20 @@ impl OnlineResolver {
         let output_template = output_dir.join(format!("{}.%(ext)s", safe_title));
 
         let (yt_dlp_cmd, ffmpeg_dir) = Self::get_tools_paths();
+        let ffmpeg_dir = ffmpeg_dir.ok_or_else(|| {
+            format!(
+                "FFmpeg not found in {}",
+                toolchain::diagnostic_lib_dir().display()
+            )
+        })?;
 
         let mut cmd = hidden_command(&yt_dlp_cmd);
-        
-        // Log tool detection status
-        if Self::is_ffmpeg_available() {
-            println!("Starting download with ffmpeg support");
-        } else {
-            println!("Starting download WITHOUT ffmpeg support (fallback mode)");
-        }
-        
+
+        println!("Starting download with ffmpeg support");
+
         match media_type {
             MediaType::Video => {
-                 if Self::is_ffmpeg_available() {
-                     cmd.arg("-f")
-                        .arg("bestvideo+bestaudio/best");
-                 } else {
-                     // Fallback to best single file if no ffmpeg (avoid merge)
-                     cmd.arg("-f")
-                        .arg("best");
-                 }
+                cmd.arg("-f").arg("bestvideo+bestaudio/best");
             },
             MediaType::Audio => {
                 cmd.arg("-x")
@@ -751,9 +644,7 @@ impl OnlineResolver {
         cmd.arg("-o")
             .arg(output_template.to_string_lossy().as_ref());
             
-        if let Some(ffmpeg) = ffmpeg_dir {
-            cmd.arg("--ffmpeg-location").arg(ffmpeg);
-        }
+        cmd.arg("--ffmpeg-location").arg(ffmpeg_dir);
             
         let mut child = cmd.arg("--no-playlist")
             .arg("--no-warnings")

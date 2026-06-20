@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A Tauri desktop media player with probe-first local and online playback."
 authors = ["Drip Player contributors"]
 license = "MIT"
-repository = "git@gitee.com:ggtool/drip-player.git"
+repository = "git@github.com:dripai/drip-player.git"
 edition = "2021"
 
 [build-dependencies]

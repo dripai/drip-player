@@ -6,11 +6,13 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git@gitee.com:ggtool/drip-player.git"
+    "url": "git@github.com:dripai/drip-player.git"
   },
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prepare:tools": "node scripts/download-tools.mjs",
+    "build:tauri": "pnpm prepare:tools && pnpm build",
     "build": "vue-tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

@@ -6,6 +6,7 @@ use std::time::Duration;
 use std::sync::{Arc, Mutex, mpsc};
 use std::process::{Command, Stdio, Child};
 use crate::services::online_resolver::OnlineResolver;
+use crate::services::toolchain;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -27,18 +28,7 @@ fn hidden_command(program: &str) -> Command {
 }
 
 fn get_duration_with_ffprobe(path: &Path) -> Option<Duration> {
-    // First try lib directory
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let lib_dir = current_dir.join("lib");
-    let ffprobe_in_lib = lib_dir.join("ffprobe.exe");
-
-    let ffprobe_cmd = if ffprobe_in_lib.exists() {
-        ffprobe_in_lib.to_string_lossy().to_string()
-    } else {
-        // Fallback to system PATH
-        "ffprobe".to_string()
-    };
-
+    let ffprobe_cmd = toolchain::tool_path("ffprobe");
     println!("Getting duration with ffprobe: {} for {:?}", ffprobe_cmd, path);
 
     let output = hidden_command(&ffprobe_cmd)
@@ -157,34 +147,24 @@ impl AudioBackend {
                     return Ok(ffprobe_duration);
                 },
                 Ok(Err(e)) => {
-                    println!("Error decoding file with rodio {:?}: {}. Trying ffmpeg fallback...", path, e);
+                    println!("Error decoding file with rodio {:?}: {}. Switching to FFmpeg audio path.", path, e);
                     self.play_with_ffmpeg(path)?;
                 },
                 Err(e) => {
-                    println!("Panic decoding file with rodio {:?}: {:?}. Trying ffmpeg fallback...", path, e);
+                    println!("Panic decoding file with rodio {:?}: {:?}. Switching to FFmpeg audio path.", path, e);
                     self.play_with_ffmpeg(path)?;
                 }
             }
         } else {
-            // Probably a URL or unreadable file, try ffmpeg
+            // Probably a URL or unreadable file, use FFmpeg.
             self.play_with_ffmpeg(path)?;
         }
         Ok(ffprobe_duration)
     }
 
     fn play_with_ffmpeg(&mut self, path: &Path) -> Result<(), String> {
-        let (_, ffmpeg_path) = OnlineResolver::get_tools_paths();
-        
-        let ffmpeg_cmd = if let Some(path) = ffmpeg_path {
-            let p = Path::new(&path);
-            if p.is_dir() {
-                p.join("ffmpeg.exe").to_string_lossy().to_string()
-            } else {
-                path
-            }
-        } else {
-            "ffmpeg".to_string()
-        };
+        let ffmpeg_cmd = OnlineResolver::get_ffmpeg_path()
+            .ok_or_else(|| format!("FFmpeg not found in {}", toolchain::diagnostic_lib_dir().display()))?;
 
         println!("Spawning ffmpeg for playback: {} -i {:?}", ffmpeg_cmd, path);
 
@@ -293,10 +273,10 @@ impl AudioBackend {
                     return;
                 },
                 Ok(Err(e)) => {
-                    println!("Error decoding file with rodio for seek: {}. Trying ffmpeg fallback...", e);
+                    println!("Error decoding file with rodio for seek: {}. Switching to FFmpeg audio path.", e);
                 },
                 Err(e) => {
-                    println!("Panic decoding file with rodio for seek: {:?}. Trying ffmpeg fallback...", e);
+                    println!("Panic decoding file with rodio for seek: {:?}. Switching to FFmpeg audio path.", e);
                 }
             }
         }

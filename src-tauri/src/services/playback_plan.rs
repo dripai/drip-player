@@ -66,7 +66,7 @@ fn plan_for_local_path(path: &Path) -> Result<PlaybackPlan, String> {
         return plan_from_probe(path, &info);
     }
 
-    plan_from_extension_fallback(path)
+    plan_from_extension(path)
 }
 
 fn plan_for_cached_path(path: &Path, media_type: &MediaType) -> Result<PlaybackPlan, String> {
@@ -80,7 +80,7 @@ fn plan_for_cached_path(path: &Path, media_type: &MediaType) -> Result<PlaybackP
         });
     }
 
-    plan_from_extension_fallback(path)
+    plan_from_extension(path)
 }
 
 fn plan_from_probe(path: &Path, info: &media_probe::MediaInfo) -> Result<PlaybackPlan, String> {
@@ -113,7 +113,7 @@ fn plan_from_probe(path: &Path, info: &media_probe::MediaInfo) -> Result<Playbac
     Err(format!("Unsupported media stream layout: {}", path.display()))
 }
 
-fn plan_from_extension_fallback(path: &Path) -> Result<PlaybackPlan, String> {
+fn plan_from_extension(path: &Path) -> Result<PlaybackPlan, String> {
     if media_capabilities::is_video_path(path) {
         Ok(PlaybackPlan::ExternalVideo {
             path: path.to_path_buf(),

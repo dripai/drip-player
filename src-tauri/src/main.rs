@@ -15,6 +15,7 @@ use services::media_probe::{self, MediaInfo};
 use services::online_resolver::{OnlineResolver, VideoPlatform};
 use services::persistence::PersistenceManager;
 use services::playback_plan::{self, PlaybackPlan};
+use services::toolchain;
 use std::sync::{Arc, Mutex};
 use tauri::{State, AppHandle, Window, Emitter, Manager, menu::{Menu, MenuItem, ContextMenu, CheckMenuItem}, tray::{TrayIconBuilder, TrayIconEvent, MouseButton}};
 use std::time::{Duration, Instant};
@@ -251,7 +252,7 @@ fn apply_playback_plan(
         }
         PlaybackPlan::ExternalVideo { path } => {
             let mpv_path = OnlineResolver::get_mpv_path()
-                .ok_or_else(|| "MPV not found. Please install MPV or place mpv.exe in the lib folder.".to_string())?;
+                .ok_or_else(|| format!("MPV not found in {}", toolchain::diagnostic_lib_dir().display()))?;
             let child = Command::new(&mpv_path)
                 .arg(&path)
                 .arg("--force-window=yes")
@@ -1001,11 +1002,9 @@ async fn on_playback_error(state: State<'_, AppState>, app_handle: AppHandle) ->
                 }
             }
         } else {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let lib_path = current_dir.join("lib").join("ffplay.exe");
-            println!("ffplay not found in lib or PATH");
+            let lib_path = toolchain::diagnostic_lib_dir().join(toolchain::executable_name("ffplay"));
+            println!("ffplay not found in bundled lib");
             println!("Checked lib path: {}", lib_path.display());
-            println!("Please download ffplay and place it in 'lib' folder or add to PATH");
         }
     } else {
         println!("Video playback error - frontend should handle video playback");
@@ -1143,15 +1142,10 @@ fn check_dependencies() -> Result<serde_json::Value, String> {
         .unwrap_or(false);
 
     // 检查 ffmpeg
-    let ffmpeg_available = if let Some(dir) = ffmpeg_dir {
-        let ffmpeg_exe = std::path::PathBuf::from(&dir).join("ffmpeg.exe");
-        ffmpeg_exe.exists()
+    let ffmpeg_available = if ffmpeg_dir.is_some() {
+        OnlineResolver::get_ffmpeg_path().is_some()
     } else {
-        hidden_command("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        false
     };
 
     // 检查 ffplay
@@ -1170,7 +1164,7 @@ fn check_dependencies() -> Result<serde_json::Value, String> {
         "ffplay": {
             "available": ffplay_available,
             "required": false,
-            "purpose": "Fallback video player"
+            "purpose": "External video player"
         }
     }))
 }
@@ -1220,7 +1214,7 @@ async fn play_with_mpv(path: String, state: State<'_, AppState>, app_handle: App
 
     // 获取 MPV 路径
     let mpv_path = OnlineResolver::get_mpv_path()
-        .ok_or_else(|| "MPV not found. Please install MPV or place mpv.exe in the lib folder.".to_string())?;
+        .ok_or_else(|| format!("MPV not found in {}", toolchain::diagnostic_lib_dir().display()))?;
 
     println!("Using MPV: {}", mpv_path);
 
@@ -1443,6 +1437,10 @@ fn main() {
             }
         })
         .setup(|app| {
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                services::toolchain::set_resource_dir(resource_dir);
+            }
+
             let handle = app.handle().clone();
             let state = app.state::<AppState>().inner().clone();
             let state_for_menu = state.clone();

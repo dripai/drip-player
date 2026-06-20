@@ -2,6 +2,12 @@
   "name": "drip-player",
   "private": true,
   "version": "0.1.0",
+  "description": "A Tauri desktop media player with probe-first local and online playback.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git@gitee.com:ggtool/drip-player.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

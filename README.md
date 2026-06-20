@@ -1,150 +1,180 @@
 # Drip Player
 
-一个基于 Tauri v2 + Vue 3 构建的现代化本地与在线媒体播放器。
+Drip Player 是一个基于 Tauri 2、Vue 3 和 Rust 的桌面媒体播放器，面向本地课程视频、音频资料和在线视频链接管理。它支持添加本地文件或文件夹，解析 YouTube、Bilibili 等在线媒体，并通过媒体探测自动选择合适的播放方式。
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Tauri](https://img.shields.io/badge/Tauri-v2-orange.svg)
-![Vue](https://img.shields.io/badge/Vue-3-green.svg)
-![Rust](https://img.shields.io/badge/Rust-Edition%202021-brown.svg)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Tauri](https://img.shields.io/badge/Tauri-2.x-orange.svg)](https://tauri.app/)
+[![Vue](https://img.shields.io/badge/Vue-3.x-42b883.svg)](https://vuejs.org/)
+[![Rust](https://img.shields.io/badge/Rust-2021-b7410e.svg)](https://www.rust-lang.org/)
 
-## ✨ 主要特性
+## 功能特性
 
-*   **混合播放引擎**: 结合 Rust 后端 (`rodio` + `ffmpeg`) 与前端 (`video.js`)，支持多种音频和视频格式。
-*   **本地媒体管理**: 支持添加本地文件和文件夹，支持递归扫描，支持拖拽。
-*   **在线媒体支持**:
-    *   支持解析和播放网络 URL。
-    *   集成 `yt-dlp` 支持 YouTube、Bilibili 等主流平台的视频解析与下载（需配置依赖）。
-    *   自动读取浏览器 Cookie 以支持会员画质或受限内容。
-*   **现代化 UI**:
-    *   基于 Tailwind CSS 的精美界面。
-    *   支持浅色/深色模式切换。
-    *   自定义标题栏与流畅的窗口控制。
-    *   紧凑的侧边栏播放列表与文件夹树视图。
-*   **稳定可靠**:
-    *   网络播放超时自动检测（5秒超时）。
-    *   全局错误提示系统。
-    *   Rust 提供的线程安全状态管理。
+- 本地媒体库：支持添加单个文件，也支持递归导入整个文件夹。
+- 播放列表和文件夹树：按文件夹浏览导入的媒体，双击即可播放。
+- 探测优先播放：使用 `ffprobe` 读取真实容器和音视频编码，再选择播放引擎。
+- 浏览器视频播放：浏览器原生支持的格式通过 `video.js` 播放。
+- 自动转封装缓存：对 H.264/AAC 等可兼容浏览器播放的文件执行无损转封装，例如 FLV 容器转 MP4。
+- 音频后端兜底：音频通过 Rust 后端和 `rodio` 播放，必要时使用 FFmpeg 兜底。
+- 外部播放器兜底：浏览器无法播放、也无法转封装的视频，可使用 MPV 播放。
+- 在线媒体：通过 `yt-dlp` 解析和下载在线视频。
+- 字幕发现：自动扫描同目录下的 `.srt`、`.vtt`、`.ass`、`.ssa` 字幕。
+- 桌面体验：深色模式、自定义标题栏、播放控制、音量、倍速、字幕和侧边栏。
 
-## 🛠️ 技术栈
+## 媒体格式策略
 
-*   **Frontend**: Vue 3, TypeScript, Tailwind CSS, Pinia, Vue Router, Lucide Icons.
-*   **Backend**: Rust, Tauri v2, Rodio, Tokio, FFmpeg (Command line wrapper).
-*   **Tools**: Vite, pnpm.
+Drip Player 不再只根据文件后缀决定播放方式。本地文件和缓存文件会先探测：
 
-## ⚙️ 环境要求
+1. 如果容器和编码属于浏览器原生支持范围，直接用内置视频播放器播放。
+2. 如果可以无损转封装成浏览器兼容 MP4，则写入本地 remux 缓存后播放。
+3. 如果是纯音频，交给 Rust 音频后端播放。
+4. 如果是视频但浏览器链路无法处理，则在安装 MPV 时使用 MPV 播放。
+5. 只有探测失败时，才根据文件后缀做最后兜底。
 
-在运行或编译本项目之前，请确保您的环境满足以下要求：
+常见输入格式：
 
-1.  **Node.js**: 建议 v18+
-2.  **Rust**: 最新稳定版 (`rustup update`)
-3.  **构建工具**: `pnpm` (`npm install -g pnpm`)
-4.  **Microsoft Visual Studio C++ Build Tools** (Windows 用户)
+- 音频：`mp3`、`wav`、`ogg`、`flac`、`m4a`、`aac`、`opus`
+- 浏览器常见视频：`mp4`、`m4v`、`webm`
+- 探测或外部播放器视频：`mkv`、`avi`、`mov`、`flv`、`wmv`、`ts`、`m2ts`、`mpg`、`mpeg`、`3gp`
 
-### 外部依赖 (可选但推荐)
+为了获得更稳定的格式支持，建议安装 FFmpeg 工具集，让应用可以调用 `ffprobe` 和 `ffmpeg`。
 
-为了获得完整的在线播放和下载体验，建议在项目根目录下创建 `lib` 文件夹，并放入以下可执行文件：
+## 环境要求
 
-*   **ffmpeg.exe**: 用于流媒体处理和格式转换。[下载 FFmpeg](https://ffmpeg.org/download.html)
-*   **yt-dlp.exe**: 用于在线视频解析和下载。[下载 yt-dlp](https://github.com/yt-dlp/yt-dlp/releases)
+- Node.js 18+
+- pnpm
+- Rust stable toolchain
+- 当前系统对应的 Tauri 2 构建环境
+- Windows 用户需要 Microsoft Visual Studio C++ Build Tools
 
-> 目录结构示例:
-> ```
-> drip-player/
-> ├── lib/
-> │   ├── ffmpeg.exe
-> │   └── yt-dlp.exe
-> ├── src/
-> ├── src-tauri/
-> ...
-> ```
-
-## 🚀 快速开始
-
-### 1. 克隆项目
+安装 pnpm：
 
 ```bash
-git clone https://github.com/your-username/drip-player.git
+npm install -g pnpm
+```
+
+## 可选外部工具
+
+应用会优先查找项目根目录下的 `lib/`，如果没有找到，再尝试使用系统 `PATH` 中的工具。`lib/` 已被 Git 忽略，不会提交到仓库。
+
+Windows 示例：
+
+```text
+drip-player/
+├── lib/
+│   ├── ffmpeg.exe
+│   ├── ffprobe.exe
+│   ├── yt-dlp.exe
+│   └── mpv.exe
+```
+
+推荐工具：
+
+- `ffmpeg` 和 `ffprobe`：媒体探测、时长识别、音频兜底、转封装缓存。
+- `yt-dlp`：在线视频解析和下载。
+- `mpv`：浏览器无法处理的视频格式兜底播放。
+
+非 Windows 系统使用不带 `.exe` 的对应可执行文件名。
+
+## 快速开始
+
+克隆项目：
+
+```bash
+git clone git@gitee.com:ggtool/drip-player.git
 cd drip-player
 ```
 
-### 2. 安装依赖
+安装依赖：
 
 ```bash
 pnpm install
 ```
 
-### 3. 开发模式运行
+开发模式启动桌面应用：
 
 ```bash
 pnpm tauri dev
 ```
-这将同时启动前端 Vite 服务器和 Tauri 应用程序窗口。
 
-## 📦 构建发布
-
-构建生产环境版本（生成 `.exe` 或 `.msi` 安装包）：
+构建发布包：
 
 ```bash
 pnpm tauri build
 ```
-构建产物通常位于 `src-tauri/target/release/bundle/` 目录下。
 
-## 📂 项目结构
+前端检查：
 
+```bash
+pnpm build
 ```
+
+Rust 后端检查：
+
+```bash
+cd src-tauri
+cargo check
+```
+
+## 项目结构
+
+```text
 drip-player/
-├── doc/                 # 项目文档与设计说明
-├── lib/                 # 外部依赖库 (ffmpeg, yt-dlp)
-├── src/                 # 前端源代码 (Vue)
-│   ├── components/      # Vue 组件
-│   ├── store/           # Pinia 状态管理
-│   ├── App.vue          # 根组件
-│   └── main.ts          # 入口文件
-├── src-tauri/           # 后端源代码 (Rust)
+├── public/                 # 前端静态资源
+├── src/                    # Vue 前端
+│   ├── components/          # 播放器、侧边栏、文件树、弹窗等组件
+│   ├── store/               # Pinia 播放器状态
+│   ├── utils/               # 前端媒体辅助函数
+│   ├── App.vue
+│   └── main.ts
+├── src-tauri/               # Rust/Tauri 后端
+│   ├── capabilities/         # Tauri 权限配置
+│   ├── icons/                # 应用图标
 │   ├── src/
-│   │   ├── handlers/    # Tauri 命令处理器
-│   │   ├── models/      # 数据模型
-│   │   ├── services/    # 核心业务逻辑 (Audio, Download, Resolver)
-│   │   ├── utils/       # 工具函数
-│   │   ├── lib.rs       # 库入口
-│   │   └── main.rs      # 主程序入口
-│   ├── capabilities/    # Tauri 权限配置
-│   └── tauri.conf.json  # Tauri 配置文件
-└── package.json         # 项目配置
+│   │   ├── handlers/         # Tauri 命令处理
+│   │   ├── models/           # 播放列表和播放器模型
+│   │   ├── services/         # 播放、探测、转封装、持久化、在线解析
+│   │   └── main.rs
+│   └── tauri.conf.json
+├── package.json
+├── pnpm-lock.yaml
+└── README.md
 ```
 
-## 📖 使用指南
+## 运行时数据
 
-### 播放控制
-*   **双击**: 播放列表中的曲目进行播放。
-*   **空格键**: 暂停/继续播放。
-*   **底部控制栏**: 包含上一曲、下一曲、进度条拖拽、音量调节。
+以下目录被 Git 忽略：
 
-### 添加媒体
-*   点击侧边栏底部的 **"Add Files"** 添加本地音乐/视频文件。
-*   点击 **"Add Folder"** 添加整个文件夹。
-*   点击 **"+"** 输入 URL 添加网络媒体。
+- `lib/`：本地外部工具。
+- `cache/`：运行时缓存。
+- `downloads/`：下载的媒体文件。
+- `doc/`：本地设计文档或私有说明。
 
-### 在线下载
-*   添加 Bilibili 或 YouTube 链接后，双击列表项。
-*   如果配置了 `yt-dlp`，系统将自动尝试下载并在下载完成后播放。
-*   下载状态会在列表中显示（转圈图标）。
+转封装缓存会自动清理。应用会按文件年龄和缓存总大小删除旧的 remux 文件。
 
-## 🤝 贡献
+## 在线媒体说明
 
-欢迎提交 Issue 和 Pull Request！
+在线媒体功能依赖 `yt-dlp`。部分平台或内容可能需要浏览器 Cookie 或登录状态。Drip Player 不绕过平台限制，只调用用户本地配置的工具完成解析和下载。
 
-## 📄 许可证
+## 贡献
 
-[MIT License](LICENSE)
+欢迎提交 Issue 和 Pull Request。
 
-## ⚠️ 免责声明
+提交改动前建议运行：
 
-本项目（Drip Player）及其源代码仅供**个人学习、学术研究和技术交流**使用，**严禁将本项目或其衍生产品用于任何形式的商业用途**（包括但不限于付费分发、广告盈利、作为商业软件的一部分等）。
+```bash
+pnpm build
+cd src-tauri
+cargo check
+```
 
-1.  **资源版权说明**：本项目不提供、存储或分发任何受版权保护的音频或视频资源。所有播放或下载的媒体内容均来源于互联网公开渠道或用户本地文件，版权归原作者、版权方或原平台所有。
-2.  **合规使用义务**：用户在使用本项目（特别是集成的第三方工具如 `yt-dlp`）下载或播放网络内容时，必须严格遵守相关国家或地区的法律法规，以及目标网站的服务条款（Terms of Service）。
-3.  **责任豁免**：任何因不当使用本项目而产生的法律纠纷、版权侵权或数据丢失等后果，均由使用者**自行承担全部责任**。项目开发者及贡献者不对用户的任何行为承担任何形式的连带责任。
-4.  **侵权处理**：如果您是相关内容的版权所有者，且认为本项目侵犯了您的合法权益，请通过 Issue 或邮件联系我们，我们将尽快处理。
+播放方式的选择应集中在后端 playback plan 中。前端 UI 不应自行根据文件后缀决定播放引擎。
 
-**下载、安装、编译或使用本项目即视为您已完全阅读、理解并同意本免责声明的所有条款。**
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
+
+## 免责声明
+
+Drip Player 不提供、托管或分发任何媒体内容。用户需要自行确保本地文件、在线播放和下载行为符合相关法律法规、版权规则以及目标平台的服务条款。
+
+FFmpeg、yt-dlp、MPV 等第三方工具不随本仓库分发。请根据这些工具各自的许可证和使用条款安装、配置和使用。

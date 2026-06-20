@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use crate::models::playlist::Track;
+use crate::models::playlist::{Track, LibraryItem, PlaylistEntry};
 use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -22,6 +22,14 @@ impl PersistenceManager {
 
     fn playlist_path() -> PathBuf {
         Self::config_dir().join("playlist.json")
+    }
+
+    fn library_path() -> PathBuf {
+        Self::config_dir().join("library.json")
+    }
+
+    fn playlist_entries_path() -> PathBuf {
+        Self::config_dir().join("playlist_entries.json")
     }
 
     fn downloads_path() -> PathBuf {
@@ -52,6 +60,44 @@ impl PersistenceManager {
             if let Ok(content) = fs::read_to_string(path) {
                 if let Ok(tracks) = serde_json::from_str(&content) {
                     return tracks;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn save_library(items: &[LibraryItem]) {
+        Self::ensure_config_dir();
+        if let Ok(json) = serde_json::to_string_pretty(items) {
+            let _ = fs::write(Self::library_path(), json);
+        }
+    }
+
+    pub fn load_library() -> Vec<LibraryItem> {
+        let path = Self::library_path();
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(items) = serde_json::from_str(&content) {
+                    return items;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn save_playlist_entries(entries: &[PlaylistEntry]) {
+        Self::ensure_config_dir();
+        if let Ok(json) = serde_json::to_string_pretty(entries) {
+            let _ = fs::write(Self::playlist_entries_path(), json);
+        }
+    }
+
+    pub fn load_playlist_entries() -> Vec<PlaylistEntry> {
+        let path = Self::playlist_entries_path();
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(entries) = serde_json::from_str(&content) {
+                    return entries;
                 }
             }
         }

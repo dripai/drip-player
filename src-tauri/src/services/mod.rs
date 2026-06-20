@@ -4,3 +4,8 @@ pub mod audio_wrapper;
 pub mod online_resolver;
 pub mod stream_server;
 pub mod persistence;
+pub mod media_capabilities;
+pub mod playback_plan;
+pub mod toolchain;
+pub mod media_probe;
+pub mod media_remux;

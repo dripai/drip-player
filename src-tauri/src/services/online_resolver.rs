@@ -180,6 +180,56 @@ fn hidden_command(program: &str) -> Command {
 }
 
 impl OnlineResolver {
+    /// Sanitize a string to be used as a filesystem-safe filename.
+    pub fn sanitize_filename(name: &str) -> String {
+        fn smart_truncate(s: &str, max_len: usize) -> String {
+            if s.len() <= max_len {
+                return s.to_string();
+            }
+            if max_len <= 4 {
+                return s.chars().take(max_len).collect();
+            }
+            let take = (max_len - 1) / 2;
+            let end_take = max_len - 1 - take;
+            let start: String = s.chars().take(take).collect();
+            let end: String = s.chars().rev().take(end_take).collect::<String>().chars().rev().collect();
+            format!("{}…{}", start, end)
+        }
+
+        let mut s = name.trim().to_string();
+        // Replace characters not allowed in filenames on Windows and other platforms
+        for ch in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+            s = s.replace(ch, "-");
+        }
+        // Remove control characters
+        s = s.chars().filter(|c| !c.is_control()).collect();
+        // Collapse sequences of whitespace
+        let mut out = String::with_capacity(s.len());
+        let mut last_space = false;
+        for ch in s.chars() {
+            if ch.is_whitespace() {
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
+            } else {
+                out.push(ch);
+                last_space = false;
+            }
+        }
+        let mut out = out.trim().to_string();
+        // Smart truncate to a reasonable length (100 chars)
+        out = smart_truncate(&out, 100);
+        // Windows filenames can't end with space or dot
+        while out.ends_with(' ') || out.ends_with('.') {
+            out.pop();
+        }
+        if out.is_empty() {
+            "untitled".to_string()
+        } else {
+            out
+        }
+    }
     pub fn get_tools_paths() -> (String, Option<String>) {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let lib_dir = current_dir.join("lib");
@@ -558,7 +608,7 @@ impl OnlineResolver {
         None
     }
 
-    pub fn download_media<F>(url: &str, id: &str, output_dir: &Path, media_type: MediaType, extra_subtitle_lang: Option<&str>, on_progress: F) -> Result<PathBuf, String>
+    pub fn download_media<F>(url: &str, id: &str, title: &str, output_dir: &Path, media_type: MediaType, extra_subtitle_lang: Option<&str>, on_progress: F) -> Result<PathBuf, String>
     where F: Fn(String) + Send + 'static + Clone
     {
         let platform = VideoPlatform::from_url(url);
@@ -578,7 +628,7 @@ impl OnlineResolver {
         let mut last_error = String::new();
 
         for strategy in strategies {
-            let res = Self::download_media_internal(url, id, output_dir, media_type.clone(), extra_subtitle_lang, on_progress.clone(), &strategy, &platform);
+            let res = Self::download_media_internal(url, id, title, output_dir, media_type.clone(), extra_subtitle_lang, on_progress.clone(), &strategy, &platform);
             match res {
                 Ok(path) => return Ok(path),
                 Err(e) => {
@@ -594,7 +644,7 @@ impl OnlineResolver {
         Err(format!("Download failed for {} after retries: {}", platform.display_name(), last_error))
     }
 
-    fn download_media_internal<F>(url: &str, id: &str, output_dir: &Path, media_type: MediaType, extra_subtitle_lang: Option<&str>, on_progress: F, strategy: &AuthStrategy, platform: &VideoPlatform) -> Result<PathBuf, String>
+    fn download_media_internal<F>(url: &str, id: &str, title: &str, output_dir: &Path, media_type: MediaType, extra_subtitle_lang: Option<&str>, on_progress: F, strategy: &AuthStrategy, platform: &VideoPlatform) -> Result<PathBuf, String>
     where F: Fn(String) + Send + 'static
     {
         // Check for existing file with same ID (ignoring extension)
@@ -605,8 +655,11 @@ impl OnlineResolver {
                 let path = entry.path();
                 if path.is_file() {
                     let name = path.file_name().unwrap().to_string_lossy();
-                    // Check if file starts with id followed by dot (to ensure exact ID match)
-                    if (name.starts_with(&format!("{}.", id)) || name == id) && !name.ends_with(".tmp") && !name.ends_with(".part") && !name.ends_with(".ytdl") {
+                    // Check if filename matches the sanitized title (possibly with a numeric suffix) or contains the id
+                    let safe_title = Self::sanitize_filename(title);
+                    let stem = name.split('.').next().unwrap_or("");
+                    let title_match = stem == safe_title || stem.starts_with(&format!("{} - ", safe_title)) || stem.contains(&safe_title);
+                    if (title_match || name.contains(id) || name == id) && !name.ends_with(".tmp") && !name.ends_with(".part") && !name.ends_with(".ytdl") {
                         // If we want video, ignore audio-only files
                         if media_type == MediaType::Video {
                             if let Some(ext) = path.extension() {
@@ -625,8 +678,9 @@ impl OnlineResolver {
             }
         }
 
-        // Use simple template, let yt-dlp handle extensions and temp files (.part)
-        let output_template = output_dir.join(format!("{}.%(ext)s", id));
+        // Use template including a sanitized title only (user requested). yt-dlp will write <title>.<ext>
+        let safe_title = Self::sanitize_filename(title);
+        let output_template = output_dir.join(format!("{}.%(ext)s", safe_title));
 
         let (yt_dlp_cmd, ffmpeg_dir) = Self::get_tools_paths();
 
@@ -747,7 +801,10 @@ impl OnlineResolver {
                     if path.is_file() {
                         if let Some(name) = path.file_name() {
                             let name_str = name.to_string_lossy();
-                            if (name_str.starts_with(&format!("{}.", id)) || name_str == id) &&
+                                    // Match downloaded media files by sanitized title (and possible numeric suffix) or by id
+                                    let stem = name_str.split('.').next().unwrap_or("").to_string();
+                                    let title_match = stem == safe_title || stem.starts_with(&format!("{} - ", safe_title)) || stem.contains(&safe_title);
+                                    if (title_match || name_str.contains(id) || name_str == id) &&
                                !name_str.ends_with(".part") &&
                                !name_str.ends_with(".ytdl") &&
                                !name_str.ends_with(".tmp") &&
@@ -768,7 +825,7 @@ impl OnlineResolver {
             println!("Download completed: {}", path.display());
             Ok(path)
         } else {
-            Err(format!("Output file not found after download (looked for {}*)", id))
+            Err(format!("Output file not found after download for title: {}", safe_title))
         }
     }
 }

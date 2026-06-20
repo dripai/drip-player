@@ -1,45 +1,111 @@
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 
-export interface Track {
-  source: any
+export interface PlaylistEntry {
+  id: string
+  item_id: string
+  added_at: number
 }
+
+export interface LibrarySourceLocal {
+  Local: {
+    path: string
+  }
+}
+
+export interface LibrarySourceRemote {
+  Remote: {
+    url: string
+    id: string
+    cached_path?: string | null
+    media_type: 'Audio' | 'Video'
+    download_status: 'NotDownloaded' | 'Downloading' | 'Downloaded'
+  }
+}
+
+export interface LibraryTrack {
+  id: string
+  title: string
+  media_type: 'Audio' | 'Video'
+  source: LibrarySourceLocal | LibrarySourceRemote
+  parent?: string | null
+}
+
+export type ResolvedTrack = LibraryTrack
+
+export type LibraryItem =
+  | { Track: LibraryTrack }
+  | { Folder: { name: string; path: string; children: LibraryItem[] } }
 
 export interface PlayerState {
   is_playing: boolean
   progress: number
   duration: number
   current_index: number | null
-  current_track: Track | null
+  current_item: LibraryItem | null
 }
 
 export type PlayMode = 'sequential' | 'random' | 'repeat_one' | 'repeat_all'
 
+// Type guard functions
+export function isSourceLocal(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceLocal {
+  return 'Local' in source
+}
+
+export function isSourceRemote(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceRemote {
+  return 'Remote' in source
+}
+
 export const usePlayerStore = defineStore('player', {
   state: () => ({
-    playlist: [] as Track[],
+    playlistEntries: [] as PlaylistEntry[],
+    libraryTree: [] as LibraryItem[],
+    playlist: [] as ResolvedTrack[],
     isPlaying: false,
     progress: 0,
     duration: 0,
     currentIndex: null as number | null,
-    currentTrack: null as Track | null,
+    currentTrack: null as ResolvedTrack | null,
     playMode: (localStorage.getItem('playMode') as PlayMode) || 'sequential' as PlayMode,
   }),
   actions: {
     async loadPlaylist() {
       try {
-        const playlist = await invoke('get_playlist') as Track[]
-        console.log('Loaded playlist:', playlist.map((t: Track) => {
-          if (t.source.Remote) {
-            return { title: t.source.Remote.title, is_downloading: t.source.Remote.is_downloading, cached_path: t.source.Remote.cached_path }
-          }
-          return { local: t.source.Local }
-        }))
-        this.playlist = playlist
+        const [playlistEntries, libraryTree] = await Promise.all([
+          invoke('get_playlist') as Promise<PlaylistEntry[]>,
+          invoke('get_library_tree') as Promise<LibraryItem[]>,
+        ])
+
+        this.playlistEntries = playlistEntries
+        this.libraryTree = libraryTree
+
+        const libraryMap = this.buildLibraryMap(libraryTree)
+        this.playlist = playlistEntries
+          .map(entry => libraryMap[entry.item_id])
+          .filter((track): track is ResolvedTrack => !!track)
+
+        console.log('Loaded playlist entries:', this.playlistEntries)
+        console.log('Resolved playlist items:', this.playlist)
       } catch (e) {
         console.error('Failed to load playlist', e)
       }
     },
+
+    buildLibraryMap(items: LibraryItem[]) {
+      const map: Record<string, ResolvedTrack> = {}
+
+      function flatten(item: LibraryItem) {
+        if ('Track' in item) {
+          map[item.Track.id] = item.Track
+        } else if ('Folder' in item) {
+          item.Folder.children.forEach(child => flatten(child))
+        }
+      }
+
+      items.forEach(item => flatten(item))
+      return map
+    },
+
     async play(index: number) {
       await invoke('play_track', { index })
     },
@@ -59,7 +125,6 @@ export const usePlayerStore = defineStore('player', {
     },
     async playRemoteTrack(index: number, extraSubtitleLang?: string) {
       // This will download if needed, then play
-      // extraSubtitleLang: optional third language for subtitles (default: zh, en)
       await invoke('download_and_play', { index, extraSubtitleLang: extraSubtitleLang || null })
     },
     async syncState() {
@@ -69,7 +134,12 @@ export const usePlayerStore = defineStore('player', {
         this.progress = state.progress
         this.duration = state.duration
         this.currentIndex = state.current_index
-        this.currentTrack = state.current_track
+
+        if (state.current_item && 'Track' in state.current_item) {
+          this.currentTrack = state.current_item.Track
+        } else {
+          this.currentTrack = null
+        }
       } catch (e) {
         console.error('Failed to sync state', e)
       }

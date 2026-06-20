@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
-import { usePlayerStore, type PlayMode } from '../store/player'
-import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Music, Maximize, Gauge, Repeat, Repeat1, Shuffle, ListOrdered, Subtitles } from 'lucide-vue-next'
+import { usePlayerStore, type PlayMode, isSourceLocal, isSourceRemote } from '../store/player'
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Music, Maximize, Gauge, Repeat, Repeat1, Shuffle, ListOrdered, Subtitles, MonitorPlay } from 'lucide-vue-next'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useI18n } from 'vue-i18n'
+import { getTrackFilePath, trackHasVideo } from '../utils/mediaCapabilities'
 
 const { t } = useI18n()
 const store = usePlayerStore()
@@ -20,6 +21,16 @@ const showPlayModeMenu = ref(false)
 const showSubtitleMenu = ref(false)
 const availableSubtitles = ref<{lang: string, path: string}[]>([])
 const currentSubtitle = ref<string | null>(null)
+const plannedBrowserVideoPath = ref<string | null>(null)
+const plannedExternalVideoPath = ref<string | null>(null)
+const plannedEngine = ref<PlaybackPlan['engine'] | null>(null)
+const isPlanningBrowserVideo = ref(false)
+
+type PlaybackPlan =
+    | { engine: 'browser_video', path?: string | null, remote_url?: string | null }
+    | { engine: 'external_video', path: string }
+    | { engine: 'audio', path: string }
+    | { engine: 'remote_pending', url: string }
 
 // Progress bar dragging state
 const isDragging = ref(false)
@@ -33,35 +44,35 @@ const CONTROLS_HIDE_DELAY = 3000 // 3 seconds of inactivity
 const currentTitle = computed(() => {
     if (!store.currentTrack) return 'No Track Playing'
     const t = store.currentTrack
-    if (t.source.Local) return t.source.Local.split(/[/\\]/).pop()
-    if (t.source.Remote) return t.source.Remote.title
+    if (isSourceLocal(t.source)) return t.source.Local.path.split(/[/\\]/).pop()
+    if (isSourceRemote(t.source)) {
+        if (t.source.Remote.cached_path) {
+            return t.source.Remote.cached_path.split(/[/\\]/).pop()
+        }
+        return t.title || t.source.Remote.url
+    }
     return 'Unknown'
 })
 
-const isVideo = computed(() => {
-    const t = store.currentTrack;
-    if (!t) return false;
-    if (t.source.Local) {
-        const ext = t.source.Local.split('.').pop()?.toLowerCase();
-        // Only mp4 and webm for browser video player
-        // mkv/avi/mov will be played as audio (extract audio track via ffmpeg)
-        return ['mp4', 'webm'].includes(ext || '');
-    }
-    if (t.source.Remote) {
-        return t.source.Remote.media_type === 'Video';
-    }
-    return false;
+const isVideo = computed(() => trackHasVideo(store.currentTrack))
+const usesBrowserPlayer = computed(() => Boolean(resolvedVideoUrl.value || plannedEngine.value === 'browser_video'))
+const usesExternalPlayer = computed(() => plannedEngine.value === 'external_video')
+const currentTrackKey = computed(() => {
+    const track = store.currentTrack
+    if (!track) return ''
+    return getTrackFilePath(track) || track.id
 })
 
 const videoSrc = computed(() => {
     if (resolvedVideoUrl.value) return resolvedVideoUrl.value;
+    if (plannedBrowserVideoPath.value) return convertFileSrc(plannedBrowserVideoPath.value);
 
     const t = store.currentTrack;
     if (!t) return '';
-    if (t.source.Local) {
-        return convertFileSrc(t.source.Local);
+    if (isSourceLocal(t.source)) {
+        return convertFileSrc(t.source.Local.path);
     }
-    if (t.source.Remote) {
+    if (isSourceRemote(t.source)) {
         if (t.source.Remote.cached_path) {
             return convertFileSrc(t.source.Remote.cached_path);
         }
@@ -90,24 +101,47 @@ const playModeIcon = computed(() => {
 const currentVideoPath = computed(() => {
     const t = store.currentTrack
     if (!t) return null
-    if (t.source.Local) return t.source.Local
-    if (t.source.Remote?.cached_path) return t.source.Remote.cached_path
+    if (isSourceLocal(t.source)) return t.source.Local.path
+    if (isSourceRemote(t.source) && t.source.Remote.cached_path) return t.source.Remote.cached_path
     return null
 })
 
 // Scan for available subtitles when track changes
-watch(() => store.currentTrack, async (newTrack) => {
+watch(currentTrackKey, async () => {
+    const newTrack = store.currentTrack
     resolvedVideoUrl.value = '';
+    plannedBrowserVideoPath.value = null;
+    plannedExternalVideoPath.value = null;
+    plannedEngine.value = null;
+    isPlanningBrowserVideo.value = false;
     availableSubtitles.value = [];
     currentSubtitle.value = null;
+    videoPlayer.value = null;
 
     if (newTrack) {
         // Scan for subtitles
         await scanSubtitles();
     }
 
+    if (newTrack && trackHasVideo(newTrack)) {
+        isPlanningBrowserVideo.value = true
+        try {
+            const plan = await invoke<PlaybackPlan>('get_playback_plan', { item: { Track: newTrack } })
+            plannedEngine.value = plan.engine
+            if (plan.engine === 'browser_video') {
+                plannedBrowserVideoPath.value = plan.path || getTrackFilePath(newTrack)
+            } else if (plan.engine === 'external_video' && plan.path) {
+                plannedExternalVideoPath.value = plan.path
+            }
+        } catch (e) {
+            console.error('Failed to get playback plan:', e)
+        } finally {
+            isPlanningBrowserVideo.value = false
+        }
+    }
+
     // Resolve online video URL if not cached
-    if (newTrack && newTrack.source.Remote) {
+    if (newTrack && isSourceRemote(newTrack.source)) {
         // If already cached, don't need to resolve URL
         if (newTrack.source.Remote.cached_path) {
             console.log('Using cached file:', newTrack.source.Remote.cached_path);
@@ -155,7 +189,7 @@ function selectSubtitle(subtitle: {lang: string, path: string} | null) {
     }
 
     currentSubtitle.value = subtitle.lang
-    if (videoPlayer.value && isVideo.value) {
+    if (videoPlayer.value && usesBrowserPlayer.value) {
         // Add subtitle track to video player
         const subtitleUrl = convertFileSrc(subtitle.path)
 
@@ -334,7 +368,7 @@ function onSeekEnd(e: Event) {
 
     const progress = val / 100
 
-    if (isVideo.value && videoPlayer.value) {
+    if (usesBrowserPlayer.value && videoPlayer.value) {
         const player = videoPlayer.value
         const duration = player.duration()
         const seekTime = duration * (val / 100)
@@ -356,7 +390,7 @@ function onSeekEnd(e: Event) {
 function togglePlayPause() {
     console.log('togglePlayPause called', { isVideo: isVideo.value, currentTrack: store.currentTrack })
 
-    if (isVideo.value && videoPlayer.value) {
+    if (usesBrowserPlayer.value && videoPlayer.value) {
         const player = videoPlayer.value
         if (player.paused()) {
             player.play()
@@ -403,7 +437,7 @@ function onVolumeChange(e: Event) {
     // 当音量为0时，确保完全静音
     const normalizedVolume = val === 0 ? 0 : val / 100
 
-    if (isVideo.value && videoPlayer.value) {
+    if (usesBrowserPlayer.value && videoPlayer.value) {
         videoPlayer.value.volume(normalizedVolume)
         console.log('Video volume set to:', normalizedVolume)
     } else {
@@ -419,7 +453,7 @@ function toggleMute() {
     isMuted.value = !isMuted.value
     console.log('Toggle mute:', isMuted.value)
 
-    if (isVideo.value && videoPlayer.value) {
+    if (usesBrowserPlayer.value && videoPlayer.value) {
         videoPlayer.value.muted(isMuted.value)
     } else {
         // Audio mute via volume
@@ -435,14 +469,14 @@ function setPlaybackRate(rate: number) {
     playbackRate.value = rate
     showSpeedMenu.value = false
 
-    if (isVideo.value && videoPlayer.value) {
+    if (usesBrowserPlayer.value && videoPlayer.value) {
         videoPlayer.value.playbackRate(rate)
     }
     // Audio playback rate would need backend support
 }
 
 function toggleFullscreen() {
-    if (isVideo.value && videoPlayer.value) {
+    if (usesBrowserPlayer.value && videoPlayer.value) {
         if (videoPlayer.value.isFullscreen()) {
             videoPlayer.value.exitFullscreen()
         } else {
@@ -466,7 +500,7 @@ function onVideoError(e: any) {
     <!-- Main Content (Art / Viz / Video) -->
     <div class="flex-1 flex items-center justify-center p-0 text-zinc-300 dark:text-zinc-700 select-none overflow-hidden relative">
 
-        <div v-if="isVideo" class="w-full h-full flex items-center justify-center bg-black">
+        <div v-if="usesBrowserPlayer && !isPlanningBrowserVideo && videoSrc" class="w-full h-full flex items-center justify-center bg-black">
             <VideoPlayer
                 class="w-full h-full"
                 :src="videoSrc"
@@ -476,6 +510,18 @@ function onVideoError(e: any) {
                 @mounted="onPlayerReady"
                 @error="onVideoError"
             />
+        </div>
+
+        <div v-else-if="isVideo && isPlanningBrowserVideo" class="w-full h-full flex items-center justify-center bg-black text-zinc-300">
+            <span class="text-sm">Preparing video...</span>
+        </div>
+
+        <div v-else-if="usesExternalPlayer" class="w-full h-full flex flex-col items-center justify-center bg-black text-zinc-300 gap-4">
+            <MonitorPlay class="w-24 h-24 opacity-60" />
+            <div class="text-center px-6">
+                <h2 class="text-xl font-semibold text-white mb-2 truncate max-w-[80vw]">{{ currentTitle }}</h2>
+                <p class="text-sm text-zinc-400">Playing with MPV</p>
+            </div>
         </div>
 
         <div v-else class="text-center w-full max-w-2xl p-8">
@@ -625,7 +671,7 @@ function onVideoError(e: any) {
                 </div>
 
                 <!-- Subtitle selector (video only) -->
-                <div v-if="isVideo" class="relative" @mouseenter="showSubtitleMenu = true" @mouseleave="showSubtitleMenu = false">
+                <div v-if="usesBrowserPlayer" class="relative" @mouseenter="showSubtitleMenu = true" @mouseleave="showSubtitleMenu = false">
                     <button
                         class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors"
                         :class="{ 'text-blue-600 dark:text-blue-400': currentSubtitle }"
@@ -698,7 +744,7 @@ function onVideoError(e: any) {
 
                 <!-- Fullscreen (video only) -->
                 <button
-                    v-if="isVideo"
+                    v-if="usesBrowserPlayer"
                     @click="toggleFullscreen"
                     class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors"
                     title="Fullscreen (F)"

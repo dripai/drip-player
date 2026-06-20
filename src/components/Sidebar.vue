@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { usePlayerStore } from '../store/player'
+import { usePlayerStore, type ResolvedTrack, isSourceRemote, isSourceLocal } from '../store/player'
 import { Plus, Music, Video, FolderOpen, Folder, Loader2 } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
@@ -8,6 +8,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useI18n } from 'vue-i18n'
 import TreeNode from './TreeNode.vue'
 import LoginDialog from './LoginDialog.vue'
+import { MEDIA_EXTENSIONS, trackHasVideo } from '../utils/mediaCapabilities'
 
 const store = usePlayerStore()
 const { t, locale } = useI18n()
@@ -84,7 +85,7 @@ async function addLocalFiles() {
             multiple: true,
             filters: [{
                 name: 'Media Files',
-                extensions: ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'mp4', 'mkv', 'webm', 'avi', 'mov']
+                extensions: MEDIA_EXTENSIONS
             }]
         });
 
@@ -137,7 +138,7 @@ function toggleFolder(path: string) {
  */
 async function playTrack(track: any) {
     try {
-        await invoke('play_track_directly', { track });
+        await invoke('play_track_directly', { item: { Track: track } });
         // 同步状态以更新播放状态（isPlaying等）
         await store.syncState();
     } catch (err) {
@@ -152,13 +153,12 @@ async function playTrack(track: any) {
 async function handleTrackDoubleClick(index: number) {
     const track = store.playlist[index];
 
-    // Check if downloading
-    if (track.source.Remote && track.source.Remote.is_downloading) {
+    if (isSourceRemote(track.source) && track.source.Remote.download_status === 'Downloading') {
         console.log('Track is downloading, please wait...');
         return;
     }
 
-    if (track.source.Remote) {
+    if (isSourceRemote(track.source)) {
         // Remote track - download first, then play
         await store.playRemoteTrack(index);
     } else {
@@ -170,19 +170,24 @@ async function handleTrackDoubleClick(index: number) {
 /**
  * 检查曲目是否正在下载
  */
-function isDownloading(track: any) {
-    return track.source.Remote && track.source.Remote.is_downloading;
+function isDownloading(track: ResolvedTrack) {
+    return isSourceRemote(track.source) && track.source.Remote.download_status === 'Downloading';
 }
 
 /**
  * 获取曲目显示标题
  */
-function getTitle(track: any) {
-    if (track.source.Local) {
-        const path = track.source.Local
+function getTitle(track: ResolvedTrack) {
+    if (isSourceLocal(track.source)) {
+        const path = track.source.Local.path
         return path.split(/[/\\]/).pop() || path
-    } else if (track.source.Remote) {
-        return track.source.Remote.title
+    }
+    if (isSourceRemote(track.source)) {
+        if (track.source.Remote.cached_path) {
+            const path = track.source.Remote.cached_path
+            return path.split(/[/\\]/).pop() || path
+        }
+        return track.title || track.source.Remote.url
     }
     return 'Unknown Track'
 }
@@ -190,15 +195,8 @@ function getTitle(track: any) {
 /**
  * 判断是否为视频文件
  */
-function isVideo(track: any) {
-    if (track.source.Remote) {
-        return track.source.Remote.media_type === 'Video'
-    }
-    if (track.source.Local) {
-        const ext = track.source.Local.split('.').pop()?.toLowerCase()
-        return ['mp4', 'mkv', 'webm', 'avi', 'mov'].includes(ext || '')
-    }
-    return false
+function isVideo(track: ResolvedTrack) {
+    return trackHasVideo(track)
 }
 
 const totalTracks = computed(() => {
@@ -303,7 +301,7 @@ function clearFolderTree() {
                 <div v-if="isDownloading(track)" class="text-[10px] text-blue-500">
                     {{ locale === 'zh' ? '下载中...' : 'Downloading...' }}
                 </div>
-                <div v-else-if="track.source.Remote && !track.source.Remote.cached_path" class="text-[10px] text-zinc-400">
+                <div v-else-if="isSourceRemote(track.source) && !track.source.Remote.cached_path" class="text-[10px] text-zinc-400">
                     {{ locale === 'zh' ? '未下载 - 双击下载并播放' : 'Not downloaded - Double click to download' }}
                 </div>
             </div>

@@ -1,4 +1,4 @@
-use crate::models::playlist::{Playlist, TrackSource, MediaType, Track};
+use crate::models::playlist::{LibraryItem, PlaylistEntry, MediaType, Playlist};
 use crate::services::audio_wrapper::AudioWrapper;
 use crate::services::persistence::PersistenceManager;
 use std::process::Child;
@@ -12,7 +12,7 @@ pub struct PlayerState {
     pub progress: f32,
     pub duration: f64,
     pub current_index: Option<usize>,
-    pub current_track: Option<Track>,
+    pub current_item: Option<LibraryItem>,
 }
 
 pub struct MusicPlayer {
@@ -20,35 +20,38 @@ pub struct MusicPlayer {
     pub progress: f32,
     pub duration: Duration,
     pub volume: f32,
-    
+
     // Time tracking for progress calculation
     pub playback_start: Option<Instant>,
     pub playback_offset: Duration, // Used for seek and pause/resume accumulation
-    
+
+    // New data model: library + playlist entries
+    pub library: Vec<LibraryItem>,
+    pub playlist_entries: Vec<PlaylistEntry>,
+    pub current_playlist_index: Option<usize>,
     pub playlist: Playlist,
+
     pub audio: AudioWrapper,
     pub video_process: Option<Child>,
-    
+
     pub current_media_path: Option<PathBuf>,
     pub current_media_type: Option<MediaType>,
-    
-    // Track playing directly from tree/file (not in playlist)
-    pub temporary_track: Option<Track>,
-    
+
+    // Item playing directly (not in playlist)
+    pub temporary_item: Option<LibraryItem>,
+
     // Settings
     pub minimize_to_tray: bool,
 }
 
 impl MusicPlayer {
     pub fn new() -> Self {
+        let library = PersistenceManager::load_library();
+        let playlist_entries = PersistenceManager::load_playlist_entries();
         let mut playlist = Playlist::new();
+        // 保留对旧播放列表的读取以便迁移，但新流程使用 library + playlist_entries
         playlist.tracks = PersistenceManager::load_playlist();
         let settings = PersistenceManager::load_settings();
-
-        // Don't set current_index on startup - let user choose what to play
-        // if !playlist.tracks.is_empty() {
-        //     playlist.current_index = Some(0);
-        // }
 
         Self {
             is_playing: false,
@@ -59,12 +62,16 @@ impl MusicPlayer {
             playback_start: None,
             playback_offset: Duration::from_secs(0),
 
+            library,
+            playlist_entries,
             playlist,
+            current_playlist_index: None,
+
             audio: AudioWrapper::new(),
             video_process: None,
             current_media_path: None,
             current_media_type: None,
-            temporary_track: None,
+            temporary_item: None,
             minimize_to_tray: settings.minimize_to_tray,
         }
     }

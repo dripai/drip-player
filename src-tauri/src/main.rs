@@ -9,9 +9,12 @@ mod utils;
 mod handlers;
 
 use models::player_state::{MusicPlayer, PlayerState};
-use models::playlist::{MediaType, TrackSource, Track, PlaylistItem};
+use models::playlist::{MediaType, TrackSource, LibraryItem, PlaylistEntry};
+use services::media_capabilities;
+use services::media_probe::{self, MediaInfo};
 use services::online_resolver::{OnlineResolver, VideoPlatform};
 use services::persistence::PersistenceManager;
+use services::playback_plan::{self, PlaybackPlan};
 use std::sync::{Arc, Mutex};
 use tauri::{State, AppHandle, Window, Emitter, Manager, menu::{Menu, MenuItem, ContextMenu, CheckMenuItem}, tray::{TrayIconBuilder, TrayIconEvent, MouseButton}};
 use std::time::{Duration, Instant};
@@ -42,39 +45,6 @@ fn hidden_command(program: &str) -> Command {
 
 #[derive(Clone)]
 struct AppState(Arc<Mutex<MusicPlayer>>);
-
-/// 使用 ffprobe 获取媒体文件时长
-fn get_duration_with_ffprobe(path: &Path) -> Option<Duration> {
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let lib_dir = current_dir.join("lib");
-    let ffprobe_in_lib = lib_dir.join("ffprobe.exe");
-
-    let ffprobe_cmd = if ffprobe_in_lib.exists() {
-        ffprobe_in_lib.to_string_lossy().to_string()
-    } else {
-        "ffprobe".to_string()
-    };
-
-    let output = hidden_command(&ffprobe_cmd)
-        .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let duration_str = String::from_utf8_lossy(&output.stdout);
-        let duration_secs: f64 = duration_str.trim().parse().ok()?;
-        println!("Duration from ffprobe: {} seconds for {:?}", duration_secs, path);
-        Some(Duration::from_secs_f64(duration_secs))
-    } else {
-        println!("ffprobe failed for {:?}", path);
-        None
-    }
-}
 
 /// 获取可执行文件目录中的缓存目录
 fn get_cache_dir() -> std::path::PathBuf {
@@ -112,11 +82,64 @@ fn paths_match(p1: &Path, p2: &Path) -> bool {
     false
 }
 
-/// 获取播放列表
+fn media_type_for_library_path(path: &Path) -> MediaType {
+    media_probe::probe(path)
+        .map(|info| info.media_type)
+        .unwrap_or_else(|| media_capabilities::media_type_from_path(path))
+}
+
+/// 获取播放列表（返回 PlaylistEntry 列表）
 #[tauri::command]
-fn get_playlist(state: State<AppState>) -> Vec<Track> {
+fn get_playlist(state: State<AppState>) -> Vec<PlaylistEntry> {
     let player = state.0.lock().unwrap();
-    player.playlist.tracks.clone()
+    // 新流程：返回基于 state 存储的 PlaylistEntry 列表
+    player.playlist_entries.clone()
+}
+
+/// 获取库树
+#[tauri::command]
+fn get_library_tree(state: State<AppState>) -> Vec<LibraryItem> {
+    let player = state.0.lock().unwrap();
+    player.library.clone()
+}
+
+/// 向库中添加项（只支持远程或本地单项）
+#[tauri::command]
+fn add_library_item(item: LibraryItem, state: State<AppState>) -> Result<(), String> {
+    let mut player = state.0.lock().unwrap();
+    player.library.push(item);
+    Ok(())
+}
+
+/// 从库中移除项（按 id 或 path 匹配）
+#[tauri::command]
+fn remove_library_item(id_or_path: String, state: State<AppState>) -> Result<(), String> {
+    let mut player = state.0.lock().unwrap();
+    player.library.retain(|it| match it {
+        LibraryItem::Track { id, .. } => id != &id_or_path,
+        LibraryItem::Folder { path, .. } => path.to_string_lossy() != id_or_path,
+    });
+    Ok(())
+}
+
+/// 将库项加入播放列表
+#[tauri::command]
+fn add_to_playlist(item_id: String, state: State<AppState>) -> Result<(), String> {
+    let mut player = state.0.lock().unwrap();
+    let entry = PlaylistEntry { id: uuid::Uuid::new_v4().to_string(), item_id, added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() };
+    player.playlist_entries.push(entry);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_playback_plan(item: LibraryItem) -> Result<PlaybackPlan, String> {
+    playback_plan::plan_for_item(&item)
+}
+
+#[tauri::command]
+fn probe_media(path: String) -> Result<MediaInfo, String> {
+    let path = std::path::PathBuf::from(path);
+    media_probe::probe(&path).ok_or_else(|| format!("Failed to probe media: {}", path.display()))
 }
 
 /// 获取播放器状态（播放/暂停、进度、时长、当前曲目）
@@ -165,232 +188,151 @@ fn get_state(state: State<AppState>) -> PlayerState {
         }
     }
 
-    let current_track = if let Some(index) = player.playlist.current_index {
-        player.playlist.tracks.get(index).cloned()
+    let current_item = if let Some(index) = player.current_playlist_index {
+        player.playlist_entries.get(index).and_then(|entry| {
+            player.library.iter().find_map(|it| match it {
+                LibraryItem::Track { id, .. } if id == &entry.item_id => Some(it.clone()),
+                _ => None,
+            })
+        })
     } else {
-        player.temporary_track.clone()
+        player.temporary_item.clone()
     };
     PlayerState {
         is_playing: player.is_playing,
         progress: player.progress,
         duration: player.duration.as_secs_f64(),
-        current_index: player.playlist.current_index,
-        current_track,
+        current_index: player.current_playlist_index,
+        current_item,
     }
 }
 
-/// 播放指定索引的曲目
+fn apply_playback_plan(
+    plan: PlaybackPlan,
+    player: &mut MusicPlayer,
+    player_handle: Arc<Mutex<MusicPlayer>>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let media_type = plan.media_type();
+    let local_path = plan.local_path().map(|p| p.to_path_buf());
+
+    player.current_media_type = Some(media_type.clone());
+    player.current_media_path = local_path.clone();
+    player.duration = Duration::from_secs(0);
+
+    if let Some(ref path) = local_path {
+        if let Some(duration) = media_probe::duration(path) {
+            player.duration = duration;
+        }
+    }
+
+    match plan {
+        PlaybackPlan::Audio { path } => {
+            let rx = player.audio.play_file(path);
+            player.is_playing = true;
+            player.playback_start = Some(Instant::now());
+
+            let app_handle_clone = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                match rx.recv() {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(e)) => {
+                        println!("Playback error: {}", e);
+                        let mut player = player_handle.lock().unwrap();
+                        player.is_playing = false;
+                        player.playback_start = None;
+                        drop(player);
+                        let _ = app_handle_clone.emit("playback-error", e);
+                        let _ = app_handle_clone.emit("player-state-changed", ());
+                    },
+                    Err(_) => {}
+                }
+            });
+        }
+        PlaybackPlan::ExternalVideo { path } => {
+            let mpv_path = OnlineResolver::get_mpv_path()
+                .ok_or_else(|| "MPV not found. Please install MPV or place mpv.exe in the lib folder.".to_string())?;
+            let child = Command::new(&mpv_path)
+                .arg(&path)
+                .arg("--force-window=yes")
+                .arg("--title=Drip Player")
+                .arg("--osd-level=1")
+                .spawn()
+                .map_err(|e| format!("Failed to start MPV: {}", e))?;
+
+            player.video_process = Some(child);
+            player.is_playing = true;
+            player.playback_start = Some(Instant::now());
+        }
+        PlaybackPlan::BrowserVideo { .. } | PlaybackPlan::RemotePending { .. } => {
+            player.is_playing = true;
+            player.playback_start = Some(Instant::now());
+        }
+    }
+
+    Ok(())
+}
+
+/// 播放指定索引的曲目（索引指向 `playlist_entries`）
 #[tauri::command]
 async fn play_track(index: usize, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut player = state.0.lock().unwrap();
-    
+
     // 停止现有的播放
     player.audio.stop();
     if let Some(mut child) = player.video_process.take() {
         let _ = child.kill();
     }
-    
+
     // 重置播放状态
     player.playback_start = None;
     player.playback_offset = Duration::from_secs(0);
     player.progress = 0.0;
-    player.temporary_track = None; // 清除临时曲目
+    player.temporary_item = None; // 清除临时项
 
-    if index >= player.playlist.tracks.len() {
+    if index >= player.playlist_entries.len() {
         return Err("Index out of bounds".into());
     }
 
-    player.playlist.current_index = Some(index);
-    let track = player.playlist.tracks[index].clone();
+    // 查找对应的库项
+    let entry = player.playlist_entries[index].clone();
+    let lib_idx = player.library.iter().position(|it| match it {
+        LibraryItem::Track { id, .. } => id == &entry.item_id,
+        _ => false,
+    }).ok_or_else(|| "Library item not found".to_string())?;
 
-    // 确定路径和类型
-    let (path, media_type) = match &track.source {
-        TrackSource::Local(p) => {
-            let mt = if let Some(ext) = p.extension() {
-                let s = ext.to_string_lossy().to_lowercase();
-                // 仅将 mp4/webm 视为视频（浏览器支持）
-                // mkv/avi/mov 将作为音频播放（通过 ffmpeg 提取音频轨道）
-                if ["mp4", "webm"].contains(&s.as_str()) {
-                    MediaType::Video
-                } else {
-                    MediaType::Audio
-                }
-            } else {
-                MediaType::Audio
-            };
-            (Some(p.clone()), mt)
-        },
-        TrackSource::Remote { cached_path, media_type, url, .. } => {
-            if let Some(p) = cached_path {
-                (Some(p.clone()), media_type.clone())
-            } else {
-                // 使用 URL 作为后端播放的路径
-                (Some(std::path::PathBuf::from(url)), media_type.clone())
-            }
-        }
-    };
+    let item = player.library[lib_idx].clone();
+    let plan = playback_plan::plan_for_item(&item)?;
 
-    player.current_media_type = Some(media_type.clone());
+    player.current_playlist_index = Some(index);
+    apply_playback_plan(plan, &mut player, state.0.clone(), app_handle.clone())?;
 
-    if media_type == MediaType::Video {
-        // 视频由前端处理 - 仅更新状态
-        player.is_playing = true;
-        player.current_media_path = path.clone();
-        player.playback_start = Some(Instant::now());
-
-        // 使用 ffprobe 获取视频文件的时长
-        if let Some(ref p) = path {
-            if let Some(duration) = get_duration_with_ffprobe(p) {
-                player.duration = duration;
-            }
-        }
-    } else {
-        // 音频由后端处理
-        if let Some(p) = path {
-            player.current_media_path = Some(p.clone());
-            let rx = player.audio.play_file(p);
-            player.is_playing = true;
-            // 记录开始时间
-            player.playback_start = Some(Instant::now());
-
-            // 异步处理结果以检查超时/错误
-            let app_handle_clone = app_handle.clone();
-            let player_clone = state.0.clone();
-            
-            tauri::async_runtime::spawn(async move {
-                match rx.recv() {
-                    Ok(Ok(_)) => {
-                        // 成功
-                    },
-                    Ok(Err(e)) => {
-                        println!("Playback error: {}", e);
-                        // 更新状态为停止
-                        let mut player = player_clone.lock().unwrap();
-                        player.is_playing = false;
-                        player.playback_start = None;
-                        drop(player); // 释放锁
-                        
-                        let _ = app_handle_clone.emit("playback-error", e);
-                        let _ = app_handle_clone.emit("player-state-changed", ());
-                    },
-                    Err(_) => {
-                        // 通道意外关闭
-                    }
-                }
-            });
-        } else {
-             // 应该不会发生，基于上述逻辑
-             player.is_playing = true;
-             player.current_media_path = None;
-        }
-    }
-    
     app_handle.emit("player-state-changed", ()).unwrap();
     Ok(())
 }
 
 /// 直接播放曲目（不加入播放列表）
 #[tauri::command]
-async fn play_track_directly(track: Track, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
+async fn play_track_directly(item: LibraryItem, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut player = state.0.lock().unwrap();
-    
+
     // 停止现有的播放
     player.audio.stop();
     if let Some(mut child) = player.video_process.take() {
         let _ = child.kill();
     }
-    
+
     // 重置播放状态
     player.playback_start = None;
     player.playback_offset = Duration::from_secs(0);
     player.progress = 0.0;
-    
-    // 设置临时曲目并清除当前列表索引
-    player.playlist.current_index = None;
-    player.temporary_track = Some(track.clone());
 
-    // 确定路径和类型
-    let (path, media_type) = match &track.source {
-        TrackSource::Local(p) => {
-            let mt = if let Some(ext) = p.extension() {
-                let s = ext.to_string_lossy().to_lowercase();
-                // 仅将 mp4/webm 视为视频（浏览器支持）
-                // mkv/avi/mov 将作为音频播放（通过 ffmpeg 提取音频轨道）
-                if ["mp4", "webm"].contains(&s.as_str()) {
-                    MediaType::Video
-                } else {
-                    MediaType::Audio
-                }
-            } else {
-                MediaType::Audio
-            };
-            (Some(p.clone()), mt)
-        },
-        TrackSource::Remote { cached_path, media_type, url, .. } => {
-            if let Some(p) = cached_path {
-                (Some(p.clone()), media_type.clone())
-            } else {
-                // 使用 URL 作为后端播放的路径
-                (Some(std::path::PathBuf::from(url)), media_type.clone())
-            }
-        }
-    };
+    // 设置临时项并清除当前播放索引
+    player.current_playlist_index = None;
+    player.temporary_item = Some(item.clone());
+    let plan = playback_plan::plan_for_item(&item)?;
+    apply_playback_plan(plan, &mut player, state.0.clone(), app_handle.clone())?;
 
-    player.current_media_type = Some(media_type.clone());
-
-    if media_type == MediaType::Video {
-        // 视频由前端处理 - 仅更新状态
-        player.is_playing = true;
-        player.current_media_path = path.clone();
-        player.playback_start = Some(Instant::now());
-
-        // 使用 ffprobe 获取视频文件的时长
-        if let Some(ref p) = path {
-            if let Some(duration) = get_duration_with_ffprobe(p) {
-                player.duration = duration;
-            }
-        }
-    } else {
-        // 音频由后端处理
-        if let Some(p) = path {
-            player.current_media_path = Some(p.clone());
-            let rx = player.audio.play_file(p);
-            player.is_playing = true;
-            // 记录开始时间
-            player.playback_start = Some(Instant::now());
-
-            // 异步处理结果以检查超时/错误
-            let app_handle_clone = app_handle.clone();
-            let player_clone = state.0.clone();
-            
-            tauri::async_runtime::spawn(async move {
-                match rx.recv() {
-                    Ok(Ok(_)) => {
-                        // 成功
-                    },
-                    Ok(Err(e)) => {
-                        println!("Playback error: {}", e);
-                        // 更新状态为停止
-                        let mut player = player_clone.lock().unwrap();
-                        player.is_playing = false;
-                        player.playback_start = None;
-                        drop(player); // 释放锁
-                        
-                        let _ = app_handle_clone.emit("playback-error", e);
-                        let _ = app_handle_clone.emit("player-state-changed", ());
-                    },
-                    Err(_) => {
-                        // 通道意外关闭
-                    }
-                }
-            });
-        } else {
-             // 应该不会发生，基于上述逻辑
-             player.is_playing = true;
-             player.current_media_path = None;
-        }
-    }
-    
     app_handle.emit("player-state-changed", ()).unwrap();
     Ok(())
 }
@@ -464,25 +406,32 @@ async fn add_local_files(paths: Vec<String>, state: State<'_, AppState>, app_han
     
     for path_str in paths {
         let path = std::path::PathBuf::from(path_str);
-        // 基本验证
         if path.exists() {
-             // 检查是否存在
-             let exists = player.playlist.tracks.iter().any(|t| {
-                 match &t.source {
-                     TrackSource::Local(p) => paths_match(p, &path),
-                     _ => false
-                 }
-             });
-             
-             if !exists {
-                 player.playlist.add_track(Track::new_local(path));
-                 added = true;
-             }
+            // 检查库中是否已有此本地项
+            let exists = player.library.iter().any(|it| match it {
+                LibraryItem::Track { source, .. } => match source {
+                    crate::models::playlist::LibrarySource::Local { path: p } => paths_match(p, &path),
+                    _ => false,
+                },
+                _ => false,
+            });
+
+            if !exists {
+                let id = path.to_string_lossy().to_string();
+                let title = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let item = LibraryItem::Track { id: id.clone(), title: title.clone(), media_type: media_type_for_library_path(&path), source: crate::models::playlist::LibrarySource::Local { path: path.clone() }, parent: path.parent().map(|p| p.to_path_buf()) };
+                player.library.push(item);
+                // 同时加入播放列表
+                let entry = PlaylistEntry { id: uuid::Uuid::new_v4().to_string(), item_id: id, added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() };
+                player.playlist_entries.push(entry);
+                added = true;
+            }
         }
     }
-    
+
     if added {
-        PersistenceManager::save_playlist(&player.playlist.tracks);
+        PersistenceManager::save_library(&player.library);
+        PersistenceManager::save_playlist_entries(&player.playlist_entries);
         app_handle.emit("playlist-updated", ()).unwrap();
     }
     Ok(())
@@ -492,38 +441,45 @@ async fn add_local_files(paths: Vec<String>, state: State<'_, AppState>, app_han
 #[tauri::command]
 async fn pick_and_add_local_files(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let file_paths = app_handle.dialog().file()
-        .add_filter("Media Files", &["mp3", "wav", "ogg", "flac", "m4a", "aac", "mp4", "mkv", "webm", "avi", "mov"])
+        .add_filter("Media Files", media_capabilities::MEDIA_EXTENSIONS)
         .blocking_pick_files();
 
     if let Some(paths) = file_paths {
         let mut player = state.0.lock().unwrap();
         let mut added = false;
 
-        for path in paths {
-            let path_buf = match path.into_path() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+            for path in paths {
+                let path_buf = match path.into_path() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
 
-            if path_buf.exists() {
-                 let exists = player.playlist.tracks.iter().any(|t| {
-                     match &t.source {
-                         TrackSource::Local(p) => paths_match(p, &path_buf),
-                         _ => false
-                     }
-                 });
+                if path_buf.exists() {
+                    let exists = player.library.iter().any(|it| match it {
+                        LibraryItem::Track { source, .. } => match source {
+                            crate::models::playlist::LibrarySource::Local { path: p } => paths_match(p, &path_buf),
+                            _ => false,
+                        },
+                        _ => false,
+                    });
 
-                 if !exists {
-                     player.playlist.add_track(Track::new_local(path_buf));
-                     added = true;
-                 }
+                    if !exists {
+                        let id = path_buf.to_string_lossy().to_string();
+                        let title = path_buf.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                        let item = LibraryItem::Track { id: id.clone(), title: title.clone(), media_type: media_type_for_library_path(&path_buf), source: crate::models::playlist::LibrarySource::Local { path: path_buf.clone() }, parent: path_buf.parent().map(|p| p.to_path_buf()) };
+                        player.library.push(item);
+                        let entry = PlaylistEntry { id: uuid::Uuid::new_v4().to_string(), item_id: id, added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() };
+                        player.playlist_entries.push(entry);
+                        added = true;
+                    }
+                }
             }
-        }
 
-        if added {
-            PersistenceManager::save_playlist(&player.playlist.tracks);
-            app_handle.emit("playlist-updated", ()).unwrap();
-        }
+            if added {
+                PersistenceManager::save_library(&player.library);
+                PersistenceManager::save_playlist_entries(&player.playlist_entries);
+                app_handle.emit("playlist-updated", ()).unwrap();
+            }
     }
 
     Ok(())
@@ -542,15 +498,12 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
         };
 
         // 递归扫描文件夹并构建树形结构
-        let media_extensions = ["mp3", "wav", "ogg", "flac", "m4a", "aac", "mp4", "mkv", "webm", "avi", "mov"];
-
-        fn scan_directory_tree(dir: &std::path::Path, extensions: &[&str]) -> Option<PlaylistItem> {
+        fn scan_directory_tree(dir: &std::path::Path) -> Option<LibraryItem> {
             let folder_name = dir.file_name()?.to_string_lossy().to_string();
             let mut children = Vec::new();
 
             if let Ok(entries) = std::fs::read_dir(dir) {
                 let mut entries: Vec<_> = entries.flatten().collect();
-                // 排序: 文件夹优先，然后是文件
                 entries.sort_by_key(|e| {
                     let path = e.path();
                     (!path.is_dir(), path.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
@@ -559,15 +512,14 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
                 for entry in entries {
                     let path = entry.path();
                     if path.is_dir() {
-                        if let Some(subfolder) = scan_directory_tree(&path, extensions) {
+                        if let Some(subfolder) = scan_directory_tree(&path) {
                             children.push(subfolder);
                         }
                     } else if path.is_file() {
-                        if let Some(ext) = path.extension() {
-                            let ext_str = ext.to_string_lossy().to_lowercase();
-                            if extensions.contains(&ext_str.as_str()) {
-                                children.push(PlaylistItem::Track(Track::new_local(path)));
-                            }
+                        if media_capabilities::is_supported_media_path(&path) {
+                            let id = path.to_string_lossy().to_string();
+                            let title = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                            children.push(LibraryItem::Track { id: id.clone(), title, media_type: media_type_for_library_path(&path), source: crate::models::playlist::LibrarySource::Local { path: path.clone() }, parent: path.parent().map(|p| p.to_path_buf()) });
                         }
                     }
                 }
@@ -576,20 +528,16 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
             if children.is_empty() {
                 None
             } else {
-                Some(PlaylistItem::Folder {
-                    name: folder_name,
-                    path: dir.to_path_buf(),
-                    children,
-                })
+                Some(LibraryItem::Folder { name: folder_name, path: dir.to_path_buf(), children })
             }
         }
 
-        if let Some(folder_item) = scan_directory_tree(&folder_buf, &media_extensions) {
-            // 扁平化树以添加曲目到播放列表
-            fn flatten_items(item: &PlaylistItem, tracks: &mut Vec<Track>) {
+        if let Some(folder_item) = scan_directory_tree(&folder_buf) {
+            // 扁平化树以添加曲目到库并生成播放列表项
+            fn flatten_items(item: &LibraryItem, tracks: &mut Vec<LibraryItem>) {
                 match item {
-                    PlaylistItem::Track(track) => tracks.push(track.clone()),
-                    PlaylistItem::Folder { children, .. } => {
+                    LibraryItem::Track { .. } => tracks.push(item.clone()),
+                    LibraryItem::Folder { children, .. } => {
                         for child in children {
                             flatten_items(child, tracks);
                         }
@@ -597,38 +545,37 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
                 }
             }
 
-            let mut new_tracks = Vec::new();
-            flatten_items(&folder_item, &mut new_tracks);
+            let mut new_items = Vec::new();
+            flatten_items(&folder_item, &mut new_items);
 
-            if new_tracks.is_empty() {
+            if new_items.is_empty() {
                 return Err("No media files found in the selected folder".into());
             }
 
-            // 添加曲目到播放列表
+            // 添加到库并加入播放队列
             let mut player = state.0.lock().unwrap();
             let mut added = false;
 
-            for track in new_tracks {
-                let path = match &track.source {
-                    TrackSource::Local(p) => p,
-                    _ => continue,
-                };
+            for item in new_items {
+                // 仅处理 Track 项
+                if let LibraryItem::Track { id, .. } = &item {
+                    let exists = player.library.iter().any(|it| match it {
+                        LibraryItem::Track { id: existing_id, .. } => existing_id == id,
+                        _ => false,
+                    });
 
-                let exists = player.playlist.tracks.iter().any(|t| {
-                    match &t.source {
-                        TrackSource::Local(p) => paths_match(p, path),
-                        _ => false
+                    if !exists {
+                        player.library.push(item.clone());
+                        let entry = PlaylistEntry { id: uuid::Uuid::new_v4().to_string(), item_id: id.clone(), added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() };
+                        player.playlist_entries.push(entry);
+                        added = true;
                     }
-                });
-
-                if !exists {
-                    player.playlist.add_track(track);
-                    added = true;
                 }
             }
 
             if added {
-                PersistenceManager::save_playlist(&player.playlist.tracks);
+                PersistenceManager::save_library(&player.library);
+                PersistenceManager::save_playlist_entries(&player.playlist_entries);
                 app_handle.emit("playlist-updated", ()).unwrap();
             }
         } else {
@@ -641,11 +588,10 @@ async fn pick_and_add_folder(app_handle: AppHandle, state: State<'_, AppState>) 
 
 /// 获取文件夹树结构
 #[tauri::command]
-fn get_folder_tree(folder_path: String) -> Result<PlaylistItem, String> {
+fn get_folder_tree(folder_path: String) -> Result<LibraryItem, String> {
     let path = std::path::PathBuf::from(folder_path);
-    let media_extensions = ["mp3", "wav", "ogg", "flac", "m4a", "aac", "mp4", "mkv", "webm", "avi", "mov"];
 
-    fn scan_directory_tree(dir: &std::path::Path, extensions: &[&str]) -> Option<PlaylistItem> {
+    fn scan_directory_tree(dir: &std::path::Path) -> Option<LibraryItem> {
         let folder_name = dir.file_name()?.to_string_lossy().to_string();
         let mut children = Vec::new();
 
@@ -659,15 +605,14 @@ fn get_folder_tree(folder_path: String) -> Result<PlaylistItem, String> {
             for entry in entries {
                 let path = entry.path();
                 if path.is_dir() {
-                    if let Some(subfolder) = scan_directory_tree(&path, extensions) {
+                    if let Some(subfolder) = scan_directory_tree(&path) {
                         children.push(subfolder);
                     }
                 } else if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        let ext_str = ext.to_string_lossy().to_lowercase();
-                        if extensions.contains(&ext_str.as_str()) {
-                            children.push(PlaylistItem::Track(Track::new_local(path)));
-                        }
+                    if media_capabilities::is_supported_media_path(&path) {
+                        let id = path.to_string_lossy().to_string();
+                        let title = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                        children.push(LibraryItem::Track { id, title, media_type: media_type_for_library_path(&path), source: crate::models::playlist::LibrarySource::Local { path: path.clone() }, parent: path.parent().map(|p| p.to_path_buf()) });
                     }
                 }
             }
@@ -676,15 +621,11 @@ fn get_folder_tree(folder_path: String) -> Result<PlaylistItem, String> {
         if children.is_empty() {
             None
         } else {
-            Some(PlaylistItem::Folder {
-                name: folder_name,
-                path: dir.to_path_buf(),
-                children,
-            })
+            Some(LibraryItem::Folder { name: folder_name, path: dir.to_path_buf(), children })
         }
     }
 
-    scan_directory_tree(&path, &media_extensions)
+    scan_directory_tree(&path)
         .ok_or_else(|| "No media files found".to_string())
 }
 
@@ -694,17 +635,18 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
     // 清理 URL (移除尾部的字符，如 :)
     let url = url.trim().trim_end_matches(':').to_string();
 
-    // 首先检查重复项 (快速检查)
+    // 首先检查库中是否已存在相同 URL
     {
         let player = state.0.lock().unwrap();
-        let exists = player.playlist.tracks.iter().any(|t| {
-            match &t.source {
-                TrackSource::Remote { url: u, .. } => u == &url,
-                _ => false
-            }
+        let exists = player.library.iter().any(|it| match it {
+            LibraryItem::Track { source, .. } => match source {
+                crate::models::playlist::LibrarySource::Remote { url: u, .. } => u == &url,
+                _ => false,
+            },
+            _ => false,
         });
         if exists {
-            return Ok(()); // 已存在，跳过
+            return Ok(());
         }
     }
 
@@ -720,7 +662,7 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
     // 发送加载完成
     app_handle.emit("url-resolving", false).unwrap();
 
-    let (title, duration, id, media_type) = match metadata_result {
+    let (title, _duration, id, media_type) = match metadata_result {
         Ok(metadata) => {
             let media_type = metadata.get_media_type();
             (
@@ -735,32 +677,17 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
         }
     };
 
-    // 添加到播放列表但不下载 - 用户必须双击下载
+    // 添加到库并生成播放列表项（不立即下载）
     let added = {
         let mut player = state.0.lock().unwrap();
-
-        // 再次检查重复项 (防止在解析时已添加)
-        let exists = player.playlist.tracks.iter().any(|t| {
-            match &t.source {
-                TrackSource::Remote { url: u, .. } => u == &url,
-                _ => false
-            }
-        });
-
-        if !exists {
-            let track = Track::new_remote(
-                url,
-                id,
-                title,
-                duration,
-                media_type
-            );
-            player.playlist.add_track(track.clone());
-            PersistenceManager::save_playlist(&player.playlist.tracks);
-            true
-        } else {
-            false
-        }
+        let item_id = id.clone();
+        let lib_item = LibraryItem::Track { id: item_id.clone(), title: title.clone(), media_type: media_type.clone(), source: crate::models::playlist::LibrarySource::Remote { url: url.clone(), id: id.clone(), cached_path: None, media_type: media_type.clone(), download_status: crate::models::playlist::DownloadStatus::NotDownloaded }, parent: None };
+        player.library.push(lib_item);
+        let entry = PlaylistEntry { id: uuid::Uuid::new_v4().to_string(), item_id: item_id.clone(), added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() };
+        player.playlist_entries.push(entry);
+        PersistenceManager::save_library(&player.library);
+        PersistenceManager::save_playlist_entries(&player.playlist_entries);
+        true
     };
 
     if added {
@@ -772,49 +699,51 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
 /// 下载并播放指定索引的曲目
 #[tauri::command]
 async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
-    // 获取曲目信息并检查是否正在下载
-    let (url, id, title, media_type, already_cached, is_downloading) = {
+    // 获取播放列表项对应的库项并检查状态
+    let (url, id, title, media_type, already_cached) = {
         let player = state.0.lock().unwrap();
-        if index >= player.playlist.tracks.len() {
+        if index >= player.playlist_entries.len() {
             return Err("Index out of bounds".into());
         }
+        let entry = &player.playlist_entries[index];
+        // 在库中查找
+        let lib_item = player.library.iter().find(|it| match it {
+            LibraryItem::Track { id: item_id, .. } => item_id == &entry.item_id,
+            _ => false,
+        }).ok_or_else(|| "Library item not found".to_string())?;
 
-        let track = &player.playlist.tracks[index];
-        match &track.source {
-            TrackSource::Remote { url, id, title, media_type, cached_path, is_downloading, .. } => {
-                // 检查是否已下载
-                let cached = if let Some(path) = cached_path {
-                    path.exists()
-                } else {
-                    false
-                };
-                (url.clone(), id.clone(), title.clone(), media_type.clone(), cached, *is_downloading)
+        match lib_item {
+            LibraryItem::Track { title, media_type, source, .. } => match source {
+                crate::models::playlist::LibrarySource::Remote { url, id, cached_path, .. } => {
+                    let cached = cached_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+                    (url.clone(), id.clone(), title.clone(), media_type.clone(), cached)
+                }
+                crate::models::playlist::LibrarySource::Local { .. } => {
+                    return Err("This is a local file, use play_track instead".into());
+                }
             },
-            TrackSource::Local(_) => {
-                // 本地文件，直接播放
-                return Err("This is a local file, use play_track instead".into());
-            }
+            _ => return Err("Selected playlist entry is not a track".into()),
         }
-    }; // 锁在这里释放
+    };
 
     // 如果已缓存，直接播放
     if already_cached {
         return play_track(index, state, app_handle).await;
     }
 
-    // 如果正在下载，返回错误
-    if is_downloading {
-        return Err("Already downloading".into());
-    }
 
-    // 标记为正在下载
+    // 标记库项为正在下载
     {
         let mut player = state.0.lock().unwrap();
-        if let Some(track) = player.playlist.tracks.get_mut(index) {
-            if let TrackSource::Remote { is_downloading, .. } = &mut track.source {
-                *is_downloading = true;
+        let entry = player.playlist_entries.get(index).cloned().ok_or_else(|| "Index out of bounds".to_string())?;
+        if let Some(it) = player.library.iter_mut().find(|it| match it { LibraryItem::Track { id, .. } => id == &entry.item_id, _ => false }) {
+            if let LibraryItem::Track { source, .. } = it {
+                if let crate::models::playlist::LibrarySource::Remote { download_status, .. } = source {
+                    *download_status = crate::models::playlist::DownloadStatus::Downloading;
+                }
             }
         }
+        PersistenceManager::save_library(&player.library);
     }
     app_handle.emit("playlist-updated", ()).unwrap();
 
@@ -835,6 +764,8 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
     let index_clone = index;
     let url_clone = url.clone();
     let id_clone = id.clone();
+    let title_for_download = title.clone();
+    let title_for_download_clone = title_for_download.clone();
     let download_dir_clone = download_dir.clone();
 
     // 在阻塞任务中下载，以免阻塞异步运行时
@@ -842,6 +773,7 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
         OnlineResolver::download_media(
             &url_clone,
             &id_clone,
+            &title_for_download_clone,
             &download_dir_clone,
             media_type,
             extra_subtitle_lang.as_deref(),
@@ -857,21 +789,35 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
             let file_name = temp_path.file_name().unwrap_or_default();
             let final_path = cache_dir.join(file_name);
 
-            // 如果存在则删除现有文件
-            if final_path.exists() {
-                let _ = std::fs::remove_file(&final_path);
+            // 如果存在同名文件，则在文件名末尾添加流水号直到不冲突
+            let safe_title = crate::services::online_resolver::OnlineResolver::sanitize_filename(&title_for_download);
+            let mut candidate = final_path.clone();
+            if candidate.exists() {
+                let mut n = 1;
+                let ext = final_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                while candidate.exists() {
+                    let numbered_name = if ext.is_empty() {
+                        format!("{} - {}", safe_title, n)
+                    } else {
+                        format!("{} - {}.{}", safe_title, n, ext)
+                    };
+                    candidate = cache_dir.join(numbered_name);
+                    n += 1;
+                }
             }
 
-            // 移动文件
-            std::fs::rename(&temp_path, &final_path)
+            // 移动/复制到确定的不冲突文件名
+            std::fs::rename(&temp_path, &candidate)
                 .or_else(|_| {
-                    // 如果重命名失败（跨设备），尝试复制+删除
-                    std::fs::copy(&temp_path, &final_path)?;
+                    std::fs::copy(&temp_path, &candidate)?;
                     std::fs::remove_file(&temp_path)
                 })
                 .map_err(|e| format!("Failed to move file: {}", e))?;
 
+            let final_path = candidate;
+
             // 将字幕文件（如果有）从下载目录移动到缓存目录
+            let safe_title_for_subs = crate::services::online_resolver::OnlineResolver::sanitize_filename(&title_for_download);
             if let Ok(entries) = std::fs::read_dir(&download_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -879,7 +825,9 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
                         if let Some(name) = path.file_name() {
                             let name_str = name.to_string_lossy();
                             // 检查是否为该视频的字幕文件
-                            if name_str.starts_with(&format!("{}.", id)) &&
+                            let stem = name_str.split('.').next().unwrap_or("");
+                            let title_match = stem == safe_title_for_subs || stem.starts_with(&format!("{} - ", safe_title_for_subs)) || stem.contains(&safe_title_for_subs);
+                            if (title_match || name_str.contains(&id)) &&
                                (name_str.ends_with(".srt") ||
                                 name_str.ends_with(".vtt") ||
                                 name_str.ends_with(".ass") ||
@@ -896,24 +844,21 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
                 }
             }
 
-            // 更新曲目的缓存路径和新标题（文件名）
+            // 更新库项的缓存路径和下载状态
             {
                 let mut player = state_clone.lock().unwrap();
-                if let Some(track) = player.playlist.tracks.get_mut(index_clone) {
-                    if let TrackSource::Remote { cached_path, title, is_downloading, .. } = &mut track.source {
-                        println!("Updating track state: cached_path={:?}, is_downloading=false", final_path);
-                        *cached_path = Some(final_path.clone());
-                        *is_downloading = false;
-                        // 更新标题为文件名（不含扩展名）
-                        if let Some(stem) = final_path.file_stem() {
-                            *title = stem.to_string_lossy().to_string();
+                let entry = player.playlist_entries.get(index_clone).cloned();
+                if let Some(entry) = entry {
+                    if let Some(it) = player.library.iter_mut().find(|it| match it { LibraryItem::Track { id, .. } => id == &entry.item_id, _ => false }) {
+                        if let LibraryItem::Track { source, .. } = it {
+                            if let crate::models::playlist::LibrarySource::Remote { cached_path, download_status, .. } = source {
+                                *cached_path = Some(final_path.clone());
+                                *download_status = crate::models::playlist::DownloadStatus::Downloaded;
+                            }
                         }
-                        println!("Track state updated successfully");
                     }
-                } else {
-                    println!("ERROR: Track at index {} not found!", index_clone);
                 }
-                PersistenceManager::save_playlist(&player.playlist.tracks);
+                PersistenceManager::save_library(&player.library);
             }
 
             println!("Emitting playlist-updated event");
@@ -923,14 +868,20 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
             play_track(index, state, app_handle).await
         },
         Err(e) => {
-            // 出错时重置下载状态
+            // 出错时重置库项下载状态
             {
                 let mut player = state_clone.lock().unwrap();
-                if let Some(track) = player.playlist.tracks.get_mut(index_clone) {
-                    if let TrackSource::Remote { is_downloading, .. } = &mut track.source {
-                        *is_downloading = false;
+                let entry = player.playlist_entries.get(index_clone).cloned();
+                if let Some(entry) = entry {
+                    if let Some(it) = player.library.iter_mut().find(|it| match it { LibraryItem::Track { id, .. } => id == &entry.item_id, _ => false }) {
+                        if let LibraryItem::Track { source, .. } = it {
+                            if let crate::models::playlist::LibrarySource::Remote { download_status, .. } = source {
+                                *download_status = crate::models::playlist::DownloadStatus::NotDownloaded;
+                            }
+                        }
                     }
                 }
+                PersistenceManager::save_library(&player.library);
             }
             app_handle.emit("playlist-updated", ()).unwrap();
             Err(format!("Download failed: {}", e))
@@ -943,28 +894,46 @@ async fn download_and_play(index: usize, extra_subtitle_lang: Option<String>, st
 async fn on_playback_error(state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     println!("Frontend playback failed");
 
-    // 获取当前曲目信息
+    // 获取当前曲目信息（基于 playlist_entries + library 或 temporary_item）
     let (url_or_path, is_video) = {
         let player = state.0.lock().unwrap();
 
-        if let Some(track) = player.playlist.current_track() {
-            let url = match &track.source {
-                TrackSource::Local(p) => p.to_string_lossy().to_string(),
-                TrackSource::Remote { url, cached_path, .. } => {
-                    if let Some(p) = cached_path {
-                        p.to_string_lossy().to_string()
+        // 优先使用正在播放的 playlist entry
+        if let Some(idx) = player.current_playlist_index {
+            if let Some(entry) = player.playlist_entries.get(idx) {
+                if let Some(lib_item) = player.library.iter().find(|it| match it { LibraryItem::Track { id, .. } => id == &entry.item_id, _ => false }) {
+                    if let LibraryItem::Track { source, media_type, .. } = lib_item {
+                        let url = match source {
+                            crate::models::playlist::LibrarySource::Local { path } => path.to_string_lossy().to_string(),
+                            crate::models::playlist::LibrarySource::Remote { url, cached_path, .. } => {
+                                if let Some(p) = cached_path { p.to_string_lossy().to_string() } else { url.clone() }
+                            }
+                        };
+                        let is_video = match media_type { MediaType::Video => true, _ => false };
+                        (url, is_video)
                     } else {
-                        url.clone()
+                        return Ok(());
                     }
+                } else {
+                    return Ok(());
                 }
-            };
-
-            let is_video = match &player.current_media_type {
-                Some(MediaType::Video) => true,
-                _ => false,
-            };
-
-            (url, is_video)
+            } else {
+                return Ok(());
+            }
+        } else if let Some(item) = &player.temporary_item {
+            // 使用临时项
+            if let LibraryItem::Track { source, media_type, .. } = item {
+                let url = match source {
+                    crate::models::playlist::LibrarySource::Local { path } => path.to_string_lossy().to_string(),
+                    crate::models::playlist::LibrarySource::Remote { url, cached_path, .. } => {
+                        if let Some(p) = cached_path { p.to_string_lossy().to_string() } else { url.clone() }
+                    }
+                };
+                let is_video = match media_type { MediaType::Video => true, _ => false };
+                (url, is_video)
+            } else {
+                return Ok(());
+            }
         } else {
             return Ok(());
         }
@@ -1115,26 +1084,25 @@ async fn show_playlist_context_menu(window: Window, locale: String) -> Result<()
 async fn remove_track(index: usize, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut player = state.0.lock().unwrap();
 
-    if index >= player.playlist.tracks.len() {
+    if index >= player.playlist_entries.len() {
         return Err("Index out of bounds".into());
     }
 
-    player.playlist.tracks.remove(index);
+    // 移除播放列表项
+    player.playlist_entries.remove(index);
 
     // 如果需要，调整当前索引
-    if let Some(current) = player.playlist.current_index {
+    if let Some(current) = player.current_playlist_index {
         if current == index {
-            // 移除了当前正在播放的曲目
-            player.playlist.current_index = None;
+            player.current_playlist_index = None;
             player.is_playing = false;
             player.audio.stop();
         } else if current > index {
-            // 如果移除的曲目在当前曲目之前，则调整索引
-            player.playlist.current_index = Some(current - 1);
+            player.current_playlist_index = Some(current - 1);
         }
     }
 
-    PersistenceManager::save_playlist(&player.playlist.tracks);
+    PersistenceManager::save_playlist_entries(&player.playlist_entries);
     app_handle.emit("playlist-updated", ()).unwrap();
     Ok(())
 }
@@ -1144,8 +1112,8 @@ async fn remove_track(index: usize, state: State<'_, AppState>, app_handle: AppH
 async fn clear_playlist(state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut player = state.0.lock().unwrap();
 
-    player.playlist.tracks.clear();
-    player.playlist.current_index = None;
+    player.playlist_entries.clear();
+    player.current_playlist_index = None;
     player.is_playing = false;
     player.audio.stop();
 
@@ -1153,7 +1121,7 @@ async fn clear_playlist(state: State<'_, AppState>, app_handle: AppHandle) -> Re
         let _ = child.kill();
     }
 
-    PersistenceManager::save_playlist(&player.playlist.tracks);
+    PersistenceManager::save_playlist_entries(&player.playlist_entries);
     app_handle.emit("playlist-updated", ()).unwrap();
     Ok(())
 }
@@ -1450,6 +1418,10 @@ fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
 fn main() {
     let player = Arc::new(Mutex::new(MusicPlayer::new()));
 
+    tauri::async_runtime::spawn_blocking(|| {
+        services::media_remux::cleanup_remux_cache();
+    });
+
     // 启动代理服务器
     tauri::async_runtime::spawn(async {
         services::stream_server::start_server(10001).await;
@@ -1518,25 +1490,26 @@ fn main() {
                         minimize_to_tray: player.minimize_to_tray,
                     };
                     PersistenceManager::save_settings(&settings);
-                } else if event_id.starts_with("remove_") {
+                }
+                if event_id.starts_with("remove_") {
                     if let Some(index_str) = event_id.strip_prefix("remove_") {
                         if let Ok(index) = index_str.parse::<usize>() {
                             let state_clone = state_for_menu.clone();
                             let app_clone = app.clone();
                             tauri::async_runtime::spawn(async move {
                                 let mut player = state_clone.0.lock().unwrap();
-                                if index < player.playlist.tracks.len() {
-                                    player.playlist.tracks.remove(index);
-                                    if let Some(current) = player.playlist.current_index {
+                                if index < player.playlist_entries.len() {
+                                    player.playlist_entries.remove(index);
+                                    if let Some(current) = player.current_playlist_index {
                                         if current == index {
-                                            player.playlist.current_index = None;
+                                            player.current_playlist_index = None;
                                             player.is_playing = false;
                                             player.audio.stop();
                                         } else if current > index {
-                                            player.playlist.current_index = Some(current - 1);
+                                            player.current_playlist_index = Some(current - 1);
                                         }
                                     }
-                                    PersistenceManager::save_playlist(&player.playlist.tracks);
+                                    PersistenceManager::save_playlist_entries(&player.playlist_entries);
                                     let _ = app_clone.emit("playlist-updated", ());
                                 }
                             });
@@ -1547,14 +1520,14 @@ fn main() {
                     let app_clone = app.clone();
                     tauri::async_runtime::spawn(async move {
                         let mut player = state_clone.0.lock().unwrap();
-                        player.playlist.tracks.clear();
-                        player.playlist.current_index = None;
+                        player.playlist_entries.clear();
+                        player.current_playlist_index = None;
                         player.is_playing = false;
                         player.audio.stop();
                         if let Some(mut child) = player.video_process.take() {
                             let _ = child.kill();
                         }
-                        PersistenceManager::save_playlist(&player.playlist.tracks);
+                        PersistenceManager::save_playlist_entries(&player.playlist_entries);
                         let _ = app_clone.emit("playlist-updated", ());
                     });
                 } else if event_id == "clear_tree" {
@@ -1569,17 +1542,33 @@ fn main() {
                     let mut player = state.0.lock().unwrap();
                     let mut added = false;
                     for track in cached_tracks {
-                        let exists = player.playlist.tracks.iter().any(|t| {
-                            match (&t.source, &track.source) {
-                                (TrackSource::Local(p1), TrackSource::Local(p2)) => paths_match(p1, p2),
-                                (TrackSource::Remote { cached_path: Some(p1), .. }, TrackSource::Local(p2)) => paths_match(p1, p2),
-                                 _ => false
-                            }
-                        });
+                        // Determine path of track
+                        let path_opt = match &track.source {
+                            TrackSource::Local(p) => Some(p.clone()),
+                            TrackSource::Remote { cached_path: Some(p), .. } => Some(p.clone()),
+                            _ => None,
+                        };
 
-                        if !exists {
-                            player.playlist.add_track(track);
-                            added = true;
+                        if let Some(path) = path_opt {
+                            let exists = player.library.iter().any(|it| match it {
+                                LibraryItem::Track { source, .. } => match source {
+                                    crate::models::playlist::LibrarySource::Local { path: p } => paths_match(p, &path),
+                                    crate::models::playlist::LibrarySource::Remote { cached_path: Some(p), .. } => paths_match(p, &path),
+                                    _ => false,
+                                },
+                                _ => false,
+                            });
+
+                            if !exists {
+                                // Add to library
+                                let id = path.to_string_lossy().to_string();
+                                let title = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                                let lib_item = LibraryItem::Track { id: id.clone(), title: title.clone(), media_type: media_type_for_library_path(&path), source: crate::models::playlist::LibrarySource::Local { path: path.clone() }, parent: path.parent().map(|p| p.to_path_buf()) };
+                                player.library.push(lib_item);
+                                let entry = PlaylistEntry { id: uuid::Uuid::new_v4().to_string(), item_id: id.clone(), added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() };
+                                player.playlist_entries.push(entry);
+                                added = true;
+                            }
                         }
                     }
 
@@ -1592,6 +1581,12 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_playlist,
+            get_library_tree,
+            add_library_item,
+            remove_library_item,
+            add_to_playlist,
+            get_playback_plan,
+            probe_media,
             play_track,
             play_track_directly,
             pause,

@@ -9,6 +9,8 @@ Drip Player 是一个基于 Tauri 2、Vue 3 和 Rust 的桌面媒体播放器，
 
 ![Drip Player 截图](drip-player.png)
 
+![Drip Player 使用截图](down.png)
+
 ## 功能特性
 
 - 本地媒体库：支持添加单个文件，也支持递归导入整个文件夹。
@@ -56,12 +58,7 @@ npm install -g pnpm
 
 ## 下载和安装
 
-Windows 用户可以在 [GitHub Releases](https://github.com/dripai/drip-player/releases) 下载安装包：
-
-![下载安装演示](down.png)
-
-- `drip-player_1.0.0_x64-setup.exe`：推荐普通用户使用。
-- `drip-player_1.0.0_x64_en-US.msi`：适合系统管理或脚本安装。
+用户可以在 [GitHub Releases](https://github.com/dripai/drip-player/releases) 下载 Windows 和 macOS 安装包。
 
 ## 随包工具
 

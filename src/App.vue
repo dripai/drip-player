@@ -5,6 +5,8 @@ import Sidebar from './components/Sidebar.vue'
 import Player from './components/Player.vue'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { check } from '@tauri-apps/plugin-updater'
+import { relaunch } from '@tauri-apps/plugin-process'
 import { Moon, Sun, PanelRightOpen, PanelRightClose, Minus, Square, X, Languages } from 'lucide-vue-next'
 import { useDark, useToggle } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
@@ -78,9 +80,26 @@ function displayToast(msg: string) {
     }, 3000)
 }
 
+async function checkForUpdates() {
+  try {
+    const update = await check()
+    if (!update) return
+
+    const accepted = window.confirm(`发现新版本 ${update.version}，是否立即更新？`)
+    if (!accepted) return
+
+    displayToast(`正在下载 ${update.version} 更新...`)
+    await update.downloadAndInstall()
+    await relaunch()
+  } catch (error) {
+    console.error('Update check failed:', error)
+  }
+}
+
 onMounted(async () => {
   await store.loadPlaylist()
   await store.syncState()
+  checkForUpdates()
 
   unlistenState = await listen('player-state-changed', () => {
     store.syncState()

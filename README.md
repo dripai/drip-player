@@ -60,6 +60,8 @@ npm install -g pnpm
 
 用户可以在 [GitHub Releases](https://github.com/dripai/drip-player/releases) 下载 Windows 和 macOS 安装包。
 
+应用启动时会检查 GitHub Releases 中的新版本。发现更新后，用户确认即可下载并安装。
+
 ## 随包工具
 
 应用只使用随安装包一起分发的 `lib/` 工具目录。开发和构建时，脚本会把当前平台需要的工具下载到项目根目录 `lib/`；打包后，这个目录会随应用一起分发。
@@ -174,6 +176,15 @@ pnpm build
 cd src-tauri
 cargo check
 ```
+
+## 发布
+
+发布新版本前，需要在 GitHub Actions secrets 中配置 Tauri updater 签名私钥：
+
+- `TAURI_SIGNING_PRIVATE_KEY`：本地生成的 updater 私钥内容。
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码。如果私钥没有密码，可不配置。
+
+推送 `v*.*.*` tag 后，GitHub Actions 会构建 Windows 和 macOS 安装包，并生成自动更新所需的签名产物。
 
 ## 许可证
 

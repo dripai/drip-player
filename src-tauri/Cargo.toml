@@ -30,3 +30,4 @@ uuid = { version = "1.7", features = ["v4"] }
 chrono = "0.4"
 base64 = "0.21"
 warp = { version = "0.3", features = ["tls", "compression"] }
+tauri-plugin-updater = "2"

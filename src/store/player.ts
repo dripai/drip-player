@@ -126,6 +126,10 @@ export const usePlayerStore = defineStore('player', {
     async playRemoteTrack(index: number, extraSubtitleLang?: string) {
       // This will download if needed, then play
       await invoke('download_and_play', { index, extraSubtitleLang: extraSubtitleLang || null })
+      await Promise.all([
+        this.loadPlaylist(),
+        this.syncState(),
+      ])
     },
     async syncState() {
       try {

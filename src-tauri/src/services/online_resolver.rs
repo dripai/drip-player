@@ -595,8 +595,11 @@ impl OnlineResolver {
 
         match media_type {
             MediaType::Video => {
-                cmd.arg("-f").arg("bestvideo+bestaudio/best");
-            },
+                cmd.arg("-f")
+                    .arg("bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+                    .arg("--merge-output-format")
+                    .arg("mp4");
+            }
             MediaType::Audio => {
                 cmd.arg("-x")
                     .arg("--audio-format")

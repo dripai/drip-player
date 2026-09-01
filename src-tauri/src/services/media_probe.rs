@@ -116,7 +116,10 @@ pub fn is_browser_native(info: &MediaInfo) -> bool {
 
 pub fn can_remux_to_browser_mp4(info: &MediaInfo) -> bool {
     matches!(info.video_codec.as_deref(), Some("h264"))
-        && matches!(info.audio_codec.as_deref(), None | Some("aac") | Some("mp3"))
+        && matches!(
+            info.audio_codec.as_deref(),
+            None | Some("aac") | Some("mp3") | Some("opus")
+        )
 }
 
 fn is_mp4_family_container(container: &str) -> bool {
@@ -126,4 +129,25 @@ fn is_mp4_family_container(container: &str) -> bool {
             "mp4" | "mov" | "m4a" | "m4v" | "3gp" | "3g2" | "mj2"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{can_remux_to_browser_mp4, MediaInfo};
+    use crate::models::playlist::MediaType;
+
+    #[test]
+    fn h264_with_opus_can_be_remuxed_for_browser_playback() {
+        let info = MediaInfo {
+            media_type: MediaType::Video,
+            duration_secs: Some(60.0),
+            container: Some("matroska,webm".to_string()),
+            video_codec: Some("h264".to_string()),
+            audio_codec: Some("opus".to_string()),
+            has_video: true,
+            has_audio: true,
+        };
+
+        assert!(can_remux_to_browser_mp4(&info));
+    }
 }

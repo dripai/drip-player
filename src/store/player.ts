@@ -45,6 +45,12 @@ export interface PlayerState {
   current_item: LibraryItem | null
 }
 
+export interface AddUrlResult {
+  outcome: 'added' | 'restored' | 'already_present'
+  item_id: string
+  playlist_index: number
+}
+
 export type PlayMode = 'sequential' | 'random' | 'repeat_one' | 'repeat_all'
 
 // Type guard functions
@@ -120,8 +126,10 @@ export const usePlayerStore = defineStore('player', {
       this.progress = progress
       await invoke('seek', { progress })
     },
-    async addUrl(url: string) {
-      await invoke('add_url_for_download', { url })
+    async addUrl(url: string): Promise<AddUrlResult> {
+      const result = await invoke<AddUrlResult>('add_url_for_download', { url })
+      await this.loadPlaylist()
+      return result
     },
     async playRemoteTrack(index: number, extraSubtitleLang?: string) {
       // This will download if needed, then play

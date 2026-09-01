@@ -543,38 +543,63 @@ impl OnlineResolver {
         Err(format!("Download failed for {} after retries: {}", platform.display_name(), last_error))
     }
 
+    pub fn find_existing_media(
+        output_dir: &Path,
+        id: &str,
+        title: &str,
+        media_type: &MediaType,
+    ) -> Option<PathBuf> {
+        let safe_title = Self::sanitize_filename(title);
+        let mut matches = std::fs::read_dir(output_dir)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                if !path.is_file() {
+                    return false;
+                }
+
+                let extension = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| extension.to_lowercase());
+                let supported = match media_type {
+                    MediaType::Video => matches!(
+                        extension.as_deref(),
+                        Some("mp4" | "webm" | "mkv" | "avi" | "mov")
+                    ),
+                    MediaType::Audio => matches!(
+                        extension.as_deref(),
+                        Some("mp3" | "m4a" | "wav" | "flac" | "ogg" | "opus" | "aac")
+                    ),
+                };
+                if !supported {
+                    return false;
+                }
+
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                stem == safe_title
+                    || stem.starts_with(&format!("{} - ", safe_title))
+                    || file_name.contains(id)
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.into_iter().next()
+    }
+
     fn download_media_internal<F>(url: &str, id: &str, title: &str, output_dir: &Path, media_type: MediaType, extra_subtitle_lang: Option<&str>, on_progress: F, strategy: &AuthStrategy, platform: &VideoPlatform) -> Result<PathBuf, String>
     where F: Fn(String) + Send + 'static
     {
         // Check for existing file with same ID (ignoring extension)
         if !output_dir.exists() {
             std::fs::create_dir_all(output_dir).map_err(|e| format!("Failed to create cache dir: {}", e))?;
-        } else if let Ok(entries) = std::fs::read_dir(output_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path.file_name().unwrap().to_string_lossy();
-                    // Check if filename matches the sanitized title (possibly with a numeric suffix) or contains the id
-                    let safe_title = Self::sanitize_filename(title);
-                    let stem = name.split('.').next().unwrap_or("");
-                    let title_match = stem == safe_title || stem.starts_with(&format!("{} - ", safe_title)) || stem.contains(&safe_title);
-                    if (title_match || name.contains(id) || name == id) && !name.ends_with(".tmp") && !name.ends_with(".part") && !name.ends_with(".ytdl") {
-                        // If we want video, ignore audio-only files
-                        if media_type == MediaType::Video {
-                            if let Some(ext) = path.extension() {
-                                let ext_str = ext.to_string_lossy().to_lowercase();
-                                if ["mp3", "m4a", "wav", "flac", "ogg", "opus", "aac"].contains(&ext_str.as_str()) {
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // Found existing file
-                        on_progress(format!("File already exists: {}", name));
-                        return Ok(path);
-                    }
-                }
-            }
+        } else if let Some(path) =
+            Self::find_existing_media(output_dir, id, title, &media_type)
+        {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            on_progress(format!("File already exists: {}", name));
+            return Ok(path);
         }
 
         // Use template including a sanitized title only (user requested). yt-dlp will write <title>.<ext>
@@ -686,36 +711,7 @@ impl OnlineResolver {
             return Err(format!("yt-dlp download error: {}", stderr_msg));
         }
 
-        // Find the downloaded file. It should match "{id}.*" but not be a temp file or subtitle
-        let mut downloaded_path = None;
-        if let Ok(entries) = std::fs::read_dir(output_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(name) = path.file_name() {
-                            let name_str = name.to_string_lossy();
-                                    // Match downloaded media files by sanitized title (and possible numeric suffix) or by id
-                                    let stem = name_str.split('.').next().unwrap_or("").to_string();
-                                    let title_match = stem == safe_title || stem.starts_with(&format!("{} - ", safe_title)) || stem.contains(&safe_title);
-                                    if (title_match || name_str.contains(id) || name_str == id) &&
-                               !name_str.ends_with(".part") &&
-                               !name_str.ends_with(".ytdl") &&
-                               !name_str.ends_with(".tmp") &&
-                               !name_str.ends_with(".srt") &&
-                               !name_str.ends_with(".vtt") &&
-                               !name_str.ends_with(".ass") &&
-                               !name_str.ends_with(".ssa") {
-                                downloaded_path = Some(path);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(path) = downloaded_path {
+        if let Some(path) = Self::find_existing_media(output_dir, id, title, &media_type) {
             println!("Download completed: {}", path.display());
             Ok(path)
         } else {

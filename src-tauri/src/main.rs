@@ -9,7 +9,7 @@ mod utils;
 mod handlers;
 
 use models::player_state::{MusicPlayer, PlayerState};
-use models::playlist::{MediaType, TrackSource, LibraryItem, PlaylistEntry};
+use models::playlist::{DownloadStatus, MediaType, TrackSource, LibraryItem, LibrarySource, PlaylistEntry};
 use services::media_capabilities;
 use services::media_probe::{self, MediaInfo};
 use services::online_resolver::{OnlineResolver, VideoPlatform};
@@ -24,6 +24,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use std::ops::Deref;
 use std::path::Path;
+use std::collections::HashSet;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -61,6 +62,21 @@ fn get_download_dir() -> std::path::PathBuf {
     get_cache_dir().join("downloading")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AddUrlOutcome {
+    Added,
+    Restored,
+    AlreadyPresent,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+struct AddUrlResult {
+    outcome: AddUrlOutcome,
+    item_id: String,
+    playlist_index: usize,
+}
+
 impl Deref for AppState {
     type Target = Arc<Mutex<MusicPlayer>>;
     fn deref(&self) -> &Self::Target {
@@ -81,6 +97,134 @@ fn paths_match(p1: &Path, p2: &Path) -> bool {
 
     #[cfg(not(windows))]
     false
+}
+
+fn ensure_playlist_entry(
+    playlist_entries: &mut Vec<PlaylistEntry>,
+    item_id: &str,
+) -> (usize, bool) {
+    if let Some(index) = playlist_entries
+        .iter()
+        .position(|entry| entry.item_id == item_id)
+    {
+        return (index, false);
+    }
+
+    playlist_entries.push(PlaylistEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        item_id: item_id.to_string(),
+        added_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    });
+    (playlist_entries.len() - 1, true)
+}
+
+fn repair_remote_cached_path(item: &mut LibraryItem, cache_dir: &Path) -> bool {
+    let LibraryItem::Track {
+        title,
+        media_type,
+        source,
+        ..
+    } = item
+    else {
+        return false;
+    };
+    let LibrarySource::Remote {
+        id,
+        cached_path,
+        download_status,
+        ..
+    } = source
+    else {
+        return false;
+    };
+
+    let resolved_path = cached_path
+        .as_ref()
+        .filter(|path| path.exists())
+        .cloned()
+        .or_else(|| OnlineResolver::find_existing_media(cache_dir, id, title, media_type));
+    let resolved_status = if resolved_path.is_some() {
+        DownloadStatus::Downloaded
+    } else {
+        DownloadStatus::NotDownloaded
+    };
+    let changed = *cached_path != resolved_path || *download_status != resolved_status;
+
+    if changed {
+        *cached_path = resolved_path;
+        *download_status = resolved_status;
+    }
+    changed
+}
+
+fn reconcile_remote_cache_state(
+    library: &mut Vec<LibraryItem>,
+    playlist_entries: &mut Vec<PlaylistEntry>,
+    cache_dir: &Path,
+) -> bool {
+    let mut changed = false;
+    for item in library.iter_mut() {
+        changed |= repair_remote_cached_path(item, cache_dir);
+    }
+
+    let remote_cached_paths = library
+        .iter()
+        .filter_map(|item| match item {
+            LibraryItem::Track {
+                id,
+                source: LibrarySource::Remote { cached_path: Some(path), .. },
+                ..
+            } => Some((path.clone(), id.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let local_to_remote = library
+        .iter()
+        .filter_map(|item| match item {
+            LibraryItem::Track {
+                id,
+                source: LibrarySource::Local { path },
+                ..
+            } => remote_cached_paths
+                .iter()
+                .find(|(remote_path, _)| paths_match(path, remote_path))
+                .map(|(_, remote_id)| (id.clone(), remote_id.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if local_to_remote.is_empty() {
+        return changed;
+    }
+
+    library.retain(|item| match item {
+        LibraryItem::Track { id, .. } => {
+            !local_to_remote.iter().any(|(local_id, _)| local_id == id)
+        }
+        _ => true,
+    });
+    for entry in playlist_entries.iter_mut() {
+        if let Some((_, remote_id)) = local_to_remote
+            .iter()
+            .find(|(local_id, _)| local_id == &entry.item_id)
+        {
+            entry.item_id = remote_id.clone();
+        }
+    }
+
+    let affected_remote_ids = local_to_remote
+        .iter()
+        .map(|(_, remote_id)| remote_id.clone())
+        .collect::<HashSet<_>>();
+    let mut seen_remote_ids = HashSet::new();
+    playlist_entries.retain(|entry| {
+        !affected_remote_ids.contains(&entry.item_id)
+            || seen_remote_ids.insert(entry.item_id.clone())
+    });
+    true
 }
 
 fn media_type_for_library_path(path: &Path) -> MediaType {
@@ -632,22 +776,55 @@ fn get_folder_tree(folder_path: String) -> Result<LibraryItem, String> {
 
 /// 添加 URL 进行下载解析
 #[tauri::command]
-async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
+async fn add_url_for_download(
+    url: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<AddUrlResult, String> {
     // 清理 URL (移除尾部的字符，如 :)
     let url = url.trim().trim_end_matches(':').to_string();
+    if url.is_empty() {
+        return Err("URL cannot be empty".to_string());
+    }
 
-    // 首先检查库中是否已存在相同 URL
+    // 相同 URL 已经解析过时，不再访问网络；确保它仍在播放列表并修复迁移后的缓存路径。
     {
-        let player = state.0.lock().unwrap();
-        let exists = player.library.iter().any(|it| match it {
-            LibraryItem::Track { source, .. } => match source {
-                crate::models::playlist::LibrarySource::Remote { url: u, .. } => u == &url,
-                _ => false,
-            },
+        let mut player = state.0.lock().unwrap();
+        let existing_index = player.library.iter().position(|item| match item {
+            LibraryItem::Track {
+                source: LibrarySource::Remote { url: existing_url, .. },
+                ..
+            } => existing_url == &url,
             _ => false,
         });
-        if exists {
-            return Ok(());
+
+        if let Some(existing_index) = existing_index {
+            let cache_changed =
+                repair_remote_cached_path(&mut player.library[existing_index], &get_cache_dir());
+            let item_id = match &player.library[existing_index] {
+                LibraryItem::Track { id, .. } => id.clone(),
+                _ => unreachable!(),
+            };
+            let (playlist_index, restored) =
+                ensure_playlist_entry(&mut player.playlist_entries, &item_id);
+
+            if cache_changed {
+                PersistenceManager::save_library(&player.library);
+            }
+            if restored {
+                PersistenceManager::save_playlist_entries(&player.playlist_entries);
+            }
+            drop(player);
+            app_handle.emit("playlist-updated", ()).unwrap();
+            return Ok(AddUrlResult {
+                outcome: if restored {
+                    AddUrlOutcome::Restored
+                } else {
+                    AddUrlOutcome::AlreadyPresent
+                },
+                item_id,
+                playlist_index,
+            });
         }
     }
 
@@ -658,10 +835,13 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
     let url_clone = url.clone();
     let metadata_result = tauri::async_runtime::spawn_blocking(move || {
         OnlineResolver::resolve_metadata(&url_clone)
-    }).await.map_err(|e| format!("Task failed: {}", e))?;
+    })
+    .await;
 
     // 发送加载完成
     app_handle.emit("url-resolving", false).unwrap();
+
+    let metadata_result = metadata_result.map_err(|e| format!("Task failed: {}", e))?;
 
     let (title, _duration, id, media_type) = match metadata_result {
         Ok(metadata) => {
@@ -678,23 +858,77 @@ async fn add_url_for_download(url: String, state: State<'_, AppState>, app_handl
         }
     };
 
-    // 添加到库并生成播放列表项（不立即下载）
-    let added = {
+    // URL 写法不同但媒体 ID 相同时复用已有库项，避免同一媒体重复入库。
+    let result = {
         let mut player = state.0.lock().unwrap();
-        let item_id = id.clone();
-        let lib_item = LibraryItem::Track { id: item_id.clone(), title: title.clone(), media_type: media_type.clone(), source: crate::models::playlist::LibrarySource::Remote { url: url.clone(), id: id.clone(), cached_path: None, media_type: media_type.clone(), download_status: crate::models::playlist::DownloadStatus::NotDownloaded }, parent: None };
-        player.library.push(lib_item);
-        let entry = PlaylistEntry { id: uuid::Uuid::new_v4().to_string(), item_id: item_id.clone(), added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() };
-        player.playlist_entries.push(entry);
-        PersistenceManager::save_library(&player.library);
-        PersistenceManager::save_playlist_entries(&player.playlist_entries);
-        true
+        let existing_index = player.library.iter().position(|item| match item {
+            LibraryItem::Track {
+                id: item_id,
+                source:
+                    LibrarySource::Remote {
+                        id: source_id,
+                        url: existing_url,
+                        ..
+                    },
+                ..
+            } => item_id == &id || source_id == &id || existing_url == &url,
+            _ => false,
+        });
+
+        if let Some(existing_index) = existing_index {
+            let cache_changed =
+                repair_remote_cached_path(&mut player.library[existing_index], &get_cache_dir());
+            let item_id = match &player.library[existing_index] {
+                LibraryItem::Track { id, .. } => id.clone(),
+                _ => unreachable!(),
+            };
+            let (playlist_index, restored) =
+                ensure_playlist_entry(&mut player.playlist_entries, &item_id);
+
+            if cache_changed {
+                PersistenceManager::save_library(&player.library);
+            }
+            if restored {
+                PersistenceManager::save_playlist_entries(&player.playlist_entries);
+            }
+            AddUrlResult {
+                outcome: if restored {
+                    AddUrlOutcome::Restored
+                } else {
+                    AddUrlOutcome::AlreadyPresent
+                },
+                item_id,
+                playlist_index,
+            }
+        } else {
+            let item_id = id.clone();
+            let lib_item = LibraryItem::Track {
+                id: item_id.clone(),
+                title,
+                media_type: media_type.clone(),
+                source: LibrarySource::Remote {
+                    url,
+                    id,
+                    cached_path: None,
+                    media_type,
+                    download_status: DownloadStatus::NotDownloaded,
+                },
+                parent: None,
+            };
+            player.library.push(lib_item);
+            let (playlist_index, _) = ensure_playlist_entry(&mut player.playlist_entries, &item_id);
+            PersistenceManager::save_library(&player.library);
+            PersistenceManager::save_playlist_entries(&player.playlist_entries);
+            AddUrlResult {
+                outcome: AddUrlOutcome::Added,
+                item_id,
+                playlist_index,
+            }
+        }
     };
 
-    if added {
-        app_handle.emit("playlist-updated", ()).unwrap();
-    }
-    Ok(())
+    app_handle.emit("playlist-updated", ()).unwrap();
+    Ok(result)
 }
 
 /// 下载并播放指定索引的曲目
@@ -1410,7 +1644,16 @@ fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
 }
 
 fn main() {
-    let player = Arc::new(Mutex::new(MusicPlayer::new()));
+    let mut initial_player = MusicPlayer::new();
+    if reconcile_remote_cache_state(
+        &mut initial_player.library,
+        &mut initial_player.playlist_entries,
+        &get_cache_dir(),
+    ) {
+        PersistenceManager::save_library(&initial_player.library);
+        PersistenceManager::save_playlist_entries(&initial_player.playlist_entries);
+    }
+    let player = Arc::new(Mutex::new(initial_player));
 
     tauri::async_runtime::spawn_blocking(|| {
         services::media_remux::cleanup_remux_cache();
@@ -1617,4 +1860,92 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn playlist_entry(item_id: &str) -> PlaylistEntry {
+        PlaylistEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            item_id: item_id.to_string(),
+            added_at: 0,
+        }
+    }
+
+    #[test]
+    fn existing_library_item_is_restored_to_playlist_once() {
+        let mut entries = Vec::new();
+
+        let (index, restored) = ensure_playlist_entry(&mut entries, "remote-id");
+        assert_eq!(index, 0);
+        assert!(restored);
+
+        let (index, restored) = ensure_playlist_entry(&mut entries, "remote-id");
+        assert_eq!(index, 0);
+        assert!(!restored);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn moved_remote_cache_is_repaired_and_local_duplicate_is_merged() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "drip-player-cache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let current_path = cache_dir.join("remote title.mp4");
+        std::fs::write(&current_path, b"test").unwrap();
+        let stale_path = cache_dir.join("old-location").join("remote title.mp4");
+        let local_id = current_path.to_string_lossy().to_string();
+
+        let mut library = vec![
+            LibraryItem::Track {
+                id: "remote-id".to_string(),
+                title: "remote title".to_string(),
+                media_type: MediaType::Video,
+                source: LibrarySource::Remote {
+                    url: "https://example.com/video".to_string(),
+                    id: "remote-id".to_string(),
+                    cached_path: Some(stale_path),
+                    media_type: MediaType::Video,
+                    download_status: DownloadStatus::Downloaded,
+                },
+                parent: None,
+            },
+            LibraryItem::Track {
+                id: local_id.clone(),
+                title: "remote title".to_string(),
+                media_type: MediaType::Video,
+                source: LibrarySource::Local {
+                    path: current_path.clone(),
+                },
+                parent: Some(cache_dir.clone()),
+            },
+        ];
+        let mut entries = vec![playlist_entry(&local_id), playlist_entry("remote-id")];
+
+        assert!(reconcile_remote_cache_state(&mut library, &mut entries, &cache_dir));
+        assert_eq!(library.len(), 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item_id, "remote-id");
+        match &library[0] {
+            LibraryItem::Track {
+                source:
+                    LibrarySource::Remote {
+                        cached_path,
+                        download_status,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(cached_path.as_deref(), Some(current_path.as_path()));
+                assert_eq!(download_status, &DownloadStatus::Downloaded);
+            }
+            _ => panic!("expected repaired remote track"),
+        }
+
+        std::fs::remove_dir_all(cache_dir).unwrap();
+    }
 }

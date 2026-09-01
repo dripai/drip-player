@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { usePlayerStore, type ResolvedTrack, isSourceRemote, isSourceLocal } from '../store/player'
 import { Plus, Music, Video, FolderOpen, Folder, Loader2 } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -16,6 +16,10 @@ const urlInput = ref('')
 const folderTree = ref<any>(null)
 const expandedFolders = ref<Set<string>>(new Set())
 const isResolvingUrl = ref(false)
+const playlistContainer = ref<HTMLElement | null>(null)
+const focusedPlaylistIndex = ref<number | null>(null)
+const urlFeedback = ref('')
+const urlFeedbackIsError = ref(false)
 
 // Login dialog state
 const showLoginDialog = ref(false)
@@ -45,12 +49,27 @@ onMounted(async () => {
  * 添加网络 URL
  */
 async function addUrl() {
-  if (!urlInput.value || isResolvingUrl.value) return
-  const url = urlInput.value
-  urlInput.value = ''
+  const url = urlInput.value.trim()
+  if (!url || isResolvingUrl.value) return
   pendingUrl.value = url
+  urlFeedback.value = ''
+  urlFeedbackIsError.value = false
+  focusedPlaylistIndex.value = null
   try {
-    await store.addUrl(url)
+    const result = await store.addUrl(url)
+    urlInput.value = ''
+    urlFeedback.value = result.outcome === 'added'
+      ? (locale.value === 'zh' ? '已添加到播放列表' : 'Added to playlist')
+      : result.outcome === 'restored'
+        ? (locale.value === 'zh' ? '已重新加入播放列表' : 'Restored to playlist')
+        : (locale.value === 'zh' ? '该地址已在播放列表中' : 'Already in playlist')
+
+    const playlistIndex = store.playlistEntries.findIndex(entry => entry.item_id === result.item_id)
+    focusedPlaylistIndex.value = playlistIndex >= 0 ? playlistIndex : result.playlist_index
+    await nextTick()
+    playlistContainer.value
+      ?.querySelector<HTMLElement>(`[data-playlist-index="${focusedPlaylistIndex.value}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   } catch (e: any) {
     console.error('Failed to add URL:', e)
     const errorStr = String(e)
@@ -62,8 +81,8 @@ async function addUrl() {
       loginUrl.value = loginInfo.login_url
       showLoginDialog.value = true
     } else {
-      // 其他错误恢复 URL
-      urlInput.value = url
+      urlFeedback.value = locale.value === 'zh' ? `添加失败：${errorStr}` : `Failed to add: ${errorStr}`
+      urlFeedbackIsError.value = true
     }
   }
 }
@@ -261,7 +280,7 @@ function clearFolderTree() {
         <span class="text-xs text-zinc-400">{{ totalTracks }} {{ t('sidebar.tracks') }}</span>
     </div>
 
-    <div class="flex-1 overflow-y-auto p-2 space-y-0.5">
+    <div ref="playlistContainer" class="flex-1 overflow-y-auto p-2 space-y-0.5">
         <!-- Folder Tree -->
         <div v-if="folderTree" class="mb-2">
             <TreeNode
@@ -279,12 +298,14 @@ function clearFolderTree() {
         <!-- Playlist -->
         <div
             v-for="(track, index) in store.playlist"
-            :key="index"
+            :key="store.playlistEntries[index]?.id || index"
+            :data-playlist-index="index"
             @dblclick="handleTrackDoubleClick(index)"
             @contextmenu="showContextMenu($event, index)"
             class="group flex items-center px-2 py-1 rounded transition-colors select-none"
             :class="{
                 'bg-zinc-200 dark:bg-zinc-800 text-blue-600 dark:text-blue-400': store.currentIndex === index,
+                'ring-1 ring-blue-500 bg-blue-50 dark:bg-blue-950/40': focusedPlaylistIndex === index,
                 'cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800': !isDownloading(track),
                 'cursor-not-allowed opacity-60': isDownloading(track)
             }"
@@ -317,6 +338,7 @@ function clearFolderTree() {
                 :disabled="isResolvingUrl"
                 class="flex-1 px-3 py-2 text-sm rounded-md border dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white disabled:opacity-50"
                 @keyup.enter="addUrl"
+                @input="urlFeedback = ''; focusedPlaylistIndex = null"
             />
             <button
                 @click="addUrl"
@@ -327,6 +349,13 @@ function clearFolderTree() {
                 <Loader2 v-if="isResolvingUrl" class="w-4 h-4 animate-spin" />
                 <Plus v-else class="w-4 h-4" />
             </button>
+        </div>
+        <div
+            v-if="urlFeedback"
+            class="text-xs"
+            :class="urlFeedbackIsError ? 'text-red-500' : 'text-blue-500'"
+        >
+            {{ urlFeedback }}
         </div>
         <div class="flex gap-2">
             <button

@@ -44,13 +44,9 @@ const CONTROLS_HIDE_DELAY = 3000 // 3 seconds of inactivity
 const currentTitle = computed(() => {
     if (!store.currentTrack) return 'No Track Playing'
     const t = store.currentTrack
+    if (t.title) return t.title
     if (isSourceLocal(t.source)) return t.source.Local.path.split(/[/\\]/).pop()
-    if (isSourceRemote(t.source)) {
-        if (t.source.Remote.cached_path) {
-            return t.source.Remote.cached_path.split(/[/\\]/).pop()
-        }
-        return t.title || t.source.Remote.url
-    }
+    if (isSourceRemote(t.source)) return t.source.Remote.url
     return 'Unknown'
 })
 
@@ -326,10 +322,9 @@ function onPlayerReady({ player }: { player: any }) {
 }
 
 function onTrackEnded() {
-    const nextIndex = store.getNextIndex();
-    console.log('Track ended, next index:', nextIndex, 'play mode:', store.playMode);
-    if (nextIndex !== null) {
-        store.play(nextIndex);
+    const nextItemId = store.getNextItemId();
+    if (nextItemId !== null) {
+        store.play(nextItemId);
     } else {
         // No next track, stop playing
         store.isPlaying = false;
@@ -411,20 +406,16 @@ function togglePlayPause() {
 }
 
 function playNext() {
-    console.log('playNext called', { currentIndex: store.currentIndex, playlistLength: store.playlist.length, playMode: store.playMode })
-    const nextIndex = store.getNextIndex()
-    if (nextIndex !== null) {
-        console.log('Playing next:', nextIndex)
-        store.play(nextIndex)
+    const nextItemId = store.getNextItemId()
+    if (nextItemId !== null) {
+        store.play(nextItemId)
     }
 }
 
 function playPrevious() {
-    console.log('playPrevious called', { currentIndex: store.currentIndex, playlistLength: store.playlist.length, playMode: store.playMode })
-    const prevIndex = store.getPrevIndex()
-    if (prevIndex !== null) {
-        console.log('Playing previous:', prevIndex)
-        store.play(prevIndex)
+    const previousItemId = store.getPrevItemId()
+    if (previousItemId !== null) {
+        store.play(previousItemId)
     }
 }
 

@@ -1,12 +1,6 @@
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 
-export interface PlaylistEntry {
-  id: string
-  item_id: string
-  added_at: number
-}
-
 export interface LibrarySourceLocal {
   Local: {
     path: string
@@ -37,23 +31,41 @@ export type LibraryItem =
   | { Track: LibraryTrack }
   | { Folder: { name: string; path: string; children: LibraryItem[] } }
 
+export type PlaylistOrigin =
+  | { kind: 'local'; path: string }
+  | { kind: 'remote'; url: string; provider: string; external_id: string }
+
+export interface PlaylistItem {
+  id: string
+  canonical_key: string
+  title: string
+  media_type: 'Audio' | 'Video'
+  origin: PlaylistOrigin
+  cached_path?: string | null
+  download_status: 'not_downloaded' | 'downloading' | 'downloaded'
+  added_at: number
+}
+
+export interface PlaylistSnapshot {
+  revision: number
+  items: PlaylistItem[]
+}
+
 export interface PlayerState {
   is_playing: boolean
   progress: number
   duration: number
-  current_index: number | null
+  current_item_id: string | null
   current_item: LibraryItem | null
 }
 
 export interface AddUrlResult {
-  outcome: 'added' | 'restored' | 'already_present'
+  outcome: 'added' | 'already_present'
   item_id: string
-  playlist_index: number
 }
 
 export type PlayMode = 'sequential' | 'random' | 'repeat_one' | 'repeat_all'
 
-// Type guard functions
 export function isSourceLocal(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceLocal {
   return 'Local' in source
 }
@@ -64,56 +76,34 @@ export function isSourceRemote(source: LibrarySourceLocal | LibrarySourceRemote)
 
 export const usePlayerStore = defineStore('player', {
   state: () => ({
-    playlistEntries: [] as PlaylistEntry[],
-    libraryTree: [] as LibraryItem[],
-    playlist: [] as ResolvedTrack[],
+    playlist: [] as PlaylistItem[],
+    playlistRevision: 0,
     isPlaying: false,
     progress: 0,
     duration: 0,
-    currentIndex: null as number | null,
+    currentItemId: null as string | null,
     currentTrack: null as ResolvedTrack | null,
-    playMode: (localStorage.getItem('playMode') as PlayMode) || 'sequential' as PlayMode,
+    playMode: ((localStorage.getItem('playMode') as PlayMode) || 'sequential') as PlayMode,
   }),
   actions: {
     async loadPlaylist() {
       try {
-        const [playlistEntries, libraryTree] = await Promise.all([
-          invoke('get_playlist') as Promise<PlaylistEntry[]>,
-          invoke('get_library_tree') as Promise<LibraryItem[]>,
-        ])
-
-        this.playlistEntries = playlistEntries
-        this.libraryTree = libraryTree
-
-        const libraryMap = this.buildLibraryMap(libraryTree)
-        this.playlist = playlistEntries
-          .map(entry => libraryMap[entry.item_id])
-          .filter((track): track is ResolvedTrack => !!track)
-
-        console.log('Loaded playlist entries:', this.playlistEntries)
-        console.log('Resolved playlist items:', this.playlist)
-      } catch (e) {
-        console.error('Failed to load playlist', e)
+        const snapshot = await invoke<PlaylistSnapshot>('get_playlist')
+        if (snapshot.revision < this.playlistRevision) return
+        this.playlistRevision = snapshot.revision
+        this.playlist = snapshot.items
+      } catch (error) {
+        console.error('Failed to load playlist', error)
       }
     },
 
-    buildLibraryMap(items: LibraryItem[]) {
-      const map: Record<string, ResolvedTrack> = {}
-
-      function flatten(item: LibraryItem) {
-        if ('Track' in item) {
-          map[item.Track.id] = item.Track
-        } else if ('Folder' in item) {
-          item.Folder.children.forEach(child => flatten(child))
-        }
+    async play(itemId: string) {
+      const item = this.playlist.find(candidate => candidate.id === itemId)
+      if (item?.origin.kind === 'remote') {
+        await this.playRemoteTrack(itemId)
+        return
       }
-
-      items.forEach(item => flatten(item))
-      return map
-    },
-
-    async play(index: number) {
-      await invoke('play_track', { index })
+      await invoke('play_item', { itemId })
     },
     async pause() {
       await invoke('pause')
@@ -122,7 +112,6 @@ export const usePlayerStore = defineStore('player', {
       await invoke('resume')
     },
     async seek(progress: number) {
-      // optimistic update
       this.progress = progress
       await invoke('seek', { progress })
     },
@@ -131,13 +120,12 @@ export const usePlayerStore = defineStore('player', {
       await this.loadPlaylist()
       return result
     },
-    async playRemoteTrack(index: number, extraSubtitleLang?: string) {
-      // This will download if needed, then play
-      await invoke('download_and_play', { index, extraSubtitleLang: extraSubtitleLang || null })
-      await Promise.all([
-        this.loadPlaylist(),
-        this.syncState(),
-      ])
+    async playRemoteTrack(itemId: string, extraSubtitleLang?: string) {
+      await invoke('download_and_play', {
+        itemId,
+        extraSubtitleLang: extraSubtitleLang || null,
+      })
+      await Promise.all([this.loadPlaylist(), this.syncState()])
     },
     async syncState() {
       try {
@@ -145,72 +133,72 @@ export const usePlayerStore = defineStore('player', {
         this.isPlaying = state.is_playing
         this.progress = state.progress
         this.duration = state.duration
-        this.currentIndex = state.current_index
-
-        if (state.current_item && 'Track' in state.current_item) {
-          this.currentTrack = state.current_item.Track
-        } else {
-          this.currentTrack = null
-        }
-      } catch (e) {
-        console.error('Failed to sync state', e)
+        this.currentItemId = state.current_item_id
+        this.currentTrack = state.current_item && 'Track' in state.current_item
+          ? state.current_item.Track
+          : null
+      } catch (error) {
+        console.error('Failed to sync state', error)
       }
     },
     async reportPlaybackError() {
-      console.log('Reporting playback error to backend...')
       await invoke('on_playback_error')
     },
     setPlayMode(mode: PlayMode) {
       this.playMode = mode
       localStorage.setItem('playMode', mode)
     },
-    getNextIndex(): number | null {
+    getNextItemId(): string | null {
       if (this.playlist.length === 0) return null
-      if (this.currentIndex === null) return 0
+      const currentIndex = this.currentItemId
+        ? this.playlist.findIndex(item => item.id === this.currentItemId)
+        : -1
+      if (currentIndex < 0) return this.playlist[0].id
 
       switch (this.playMode) {
         case 'sequential':
-          // Stop at end
-          if (this.currentIndex >= this.playlist.length - 1) return null
-          return this.currentIndex + 1
-        case 'random':
-          // Random track (avoid same track if possible)
-          if (this.playlist.length === 1) return 0
-          let nextIdx: number
+          return currentIndex >= this.playlist.length - 1
+            ? null
+            : this.playlist[currentIndex + 1].id
+        case 'random': {
+          if (this.playlist.length === 1) return this.playlist[0].id
+          let nextIndex: number
           do {
-            nextIdx = Math.floor(Math.random() * this.playlist.length)
-          } while (nextIdx === this.currentIndex && this.playlist.length > 1)
-          return nextIdx
+            nextIndex = Math.floor(Math.random() * this.playlist.length)
+          } while (nextIndex === currentIndex)
+          return this.playlist[nextIndex].id
+        }
         case 'repeat_one':
-          return this.currentIndex
+          return this.playlist[currentIndex].id
         case 'repeat_all':
-          return (this.currentIndex + 1) % this.playlist.length
-        default:
-          return null
+          return this.playlist[(currentIndex + 1) % this.playlist.length].id
       }
     },
-    getPrevIndex(): number | null {
+    getPrevItemId(): string | null {
       if (this.playlist.length === 0) return null
-      if (this.currentIndex === null) return this.playlist.length - 1
+      const currentIndex = this.currentItemId
+        ? this.playlist.findIndex(item => item.id === this.currentItemId)
+        : -1
+      if (currentIndex < 0) return this.playlist[this.playlist.length - 1].id
 
       switch (this.playMode) {
         case 'sequential':
-          if (this.currentIndex <= 0) return null
-          return this.currentIndex - 1
-        case 'random':
-          if (this.playlist.length === 1) return 0
-          let prevIdx: number
+          return currentIndex <= 0 ? null : this.playlist[currentIndex - 1].id
+        case 'random': {
+          if (this.playlist.length === 1) return this.playlist[0].id
+          let previousIndex: number
           do {
-            prevIdx = Math.floor(Math.random() * this.playlist.length)
-          } while (prevIdx === this.currentIndex && this.playlist.length > 1)
-          return prevIdx
+            previousIndex = Math.floor(Math.random() * this.playlist.length)
+          } while (previousIndex === currentIndex)
+          return this.playlist[previousIndex].id
+        }
         case 'repeat_one':
-          return this.currentIndex
+          return this.playlist[currentIndex].id
         case 'repeat_all':
-          return this.currentIndex === 0 ? this.playlist.length - 1 : this.currentIndex - 1
-        default:
-          return null
+          return this.playlist[
+            currentIndex === 0 ? this.playlist.length - 1 : currentIndex - 1
+          ].id
       }
-    }
-  }
+    },
+  },
 })

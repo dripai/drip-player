@@ -132,9 +132,9 @@ onMounted(async () => {
         if (store.progress >= 0.99 && lastProgress < 0.99 && !trackEndedHandled && store.duration > 0) {
             console.log('Audio track ended, progress:', store.progress, 'play mode:', store.playMode)
             trackEndedHandled = true
-            const nextIndex = store.getNextIndex()
-            if (nextIndex !== null) {
-                store.play(nextIndex)
+            const nextItemId = store.getNextItemId()
+            if (nextItemId !== null) {
+                store.play(nextItemId)
             } else {
                 store.isPlaying = false
             }
@@ -144,7 +144,7 @@ onMounted(async () => {
   }, 500)
 
   // Reset trackEndedHandled when track changes
-  watch(() => store.currentIndex, () => {
+  watch(() => store.currentItemId, () => {
     trackEndedHandled = false
     lastProgress = 0
   })

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted } from 'vue'
-import { usePlayerStore, type ResolvedTrack, isSourceRemote, isSourceLocal } from '../store/player'
+import { usePlayerStore, type PlaylistItem } from '../store/player'
 import { Plus, Music, Video, FolderOpen, Folder, Loader2 } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
@@ -8,7 +8,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useI18n } from 'vue-i18n'
 import TreeNode from './TreeNode.vue'
 import LoginDialog from './LoginDialog.vue'
-import { MEDIA_EXTENSIONS, trackHasVideo } from '../utils/mediaCapabilities'
+import { MEDIA_EXTENSIONS } from '../utils/mediaCapabilities'
 
 const store = usePlayerStore()
 const { t, locale } = useI18n()
@@ -17,7 +17,7 @@ const folderTree = ref<any>(null)
 const expandedFolders = ref<Set<string>>(new Set())
 const isResolvingUrl = ref(false)
 const playlistContainer = ref<HTMLElement | null>(null)
-const focusedPlaylistIndex = ref<number | null>(null)
+const focusedPlaylistItemId = ref<string | null>(null)
 const urlFeedback = ref('')
 const urlFeedbackIsError = ref(false)
 
@@ -54,21 +54,18 @@ async function addUrl() {
   pendingUrl.value = url
   urlFeedback.value = ''
   urlFeedbackIsError.value = false
-  focusedPlaylistIndex.value = null
+  focusedPlaylistItemId.value = null
   try {
     const result = await store.addUrl(url)
     urlInput.value = ''
     urlFeedback.value = result.outcome === 'added'
       ? (locale.value === 'zh' ? '已添加到播放列表' : 'Added to playlist')
-      : result.outcome === 'restored'
-        ? (locale.value === 'zh' ? '已重新加入播放列表' : 'Restored to playlist')
-        : (locale.value === 'zh' ? '该地址已在播放列表中' : 'Already in playlist')
+      : (locale.value === 'zh' ? '该地址已在播放列表中' : 'Already in playlist')
 
-    const playlistIndex = store.playlistEntries.findIndex(entry => entry.item_id === result.item_id)
-    focusedPlaylistIndex.value = playlistIndex >= 0 ? playlistIndex : result.playlist_index
+    focusedPlaylistItemId.value = result.item_id
     await nextTick()
     playlistContainer.value
-      ?.querySelector<HTMLElement>(`[data-playlist-index="${focusedPlaylistIndex.value}"]`)
+      ?.querySelector<HTMLElement>(`[data-playlist-item-id="${focusedPlaylistItemId.value}"]`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   } catch (e: any) {
     console.error('Failed to add URL:', e)
@@ -169,53 +166,41 @@ async function playTrack(track: any) {
  * 处理曲目双击事件
  * 如果是远程曲目且未下载，则先下载
  */
-async function handleTrackDoubleClick(index: number) {
-    const track = store.playlist[index];
+async function handleTrackDoubleClick(item: PlaylistItem) {
 
-    if (isSourceRemote(track.source) && track.source.Remote.download_status === 'Downloading') {
+    if (item.download_status === 'downloading') {
         console.log('Track is downloading, please wait...');
         return;
     }
 
-    if (isSourceRemote(track.source)) {
-        // Remote track - download first, then play
-        await store.playRemoteTrack(index);
+    if (item.origin.kind === 'remote') {
+        await store.playRemoteTrack(item.id);
     } else {
-        // Local track - play directly
-        await store.play(index);
+        await store.play(item.id);
     }
 }
 
 /**
  * 检查曲目是否正在下载
  */
-function isDownloading(track: ResolvedTrack) {
-    return isSourceRemote(track.source) && track.source.Remote.download_status === 'Downloading';
+function isDownloading(item: PlaylistItem) {
+    return item.download_status === 'downloading';
 }
 
 /**
  * 获取曲目显示标题
  */
-function getTitle(track: ResolvedTrack) {
-    if (isSourceLocal(track.source)) {
-        const path = track.source.Local.path
-        return path.split(/[/\\]/).pop() || path
-    }
-    if (isSourceRemote(track.source)) {
-        if (track.source.Remote.cached_path) {
-            const path = track.source.Remote.cached_path
-            return path.split(/[/\\]/).pop() || path
-        }
-        return track.title || track.source.Remote.url
-    }
-    return 'Unknown Track'
+function getTitle(item: PlaylistItem) {
+    return item.title || (item.origin.kind === 'local'
+        ? item.origin.path.split(/[/\\]/).pop() || item.origin.path
+        : item.origin.url)
 }
 
 /**
  * 判断是否为视频文件
  */
-function isVideo(track: ResolvedTrack) {
-    return trackHasVideo(track)
+function isVideo(item: PlaylistItem) {
+    return item.media_type === 'Video'
 }
 
 const totalTracks = computed(() => {
@@ -240,10 +225,10 @@ function countTracksInTree(item: any): number {
 /**
  * 显示曲目右键菜单
  */
-async function showContextMenu(e: MouseEvent, index: number) {
+async function showContextMenu(e: MouseEvent, itemId: string) {
     e.preventDefault()
     try {
-        await invoke('show_track_context_menu', { index, locale: locale.value })
+        await invoke('show_track_context_menu', { itemId, locale: locale.value })
     } catch (err) {
         console.error('Failed to show context menu:', err)
     }
@@ -289,40 +274,38 @@ function clearFolderTree() {
                 :expanded-folders="expandedFolders"
                 @toggle-folder="toggleFolder"
                 @play-track="playTrack"
-                :current-index="store.currentIndex"
                 :current-track="store.currentTrack"
-                :playlist="store.playlist"
             />
         </div>
 
         <!-- Playlist -->
         <div
-            v-for="(track, index) in store.playlist"
-            :key="store.playlistEntries[index]?.id || index"
-            :data-playlist-index="index"
-            @dblclick="handleTrackDoubleClick(index)"
-            @contextmenu="showContextMenu($event, index)"
+            v-for="item in store.playlist"
+            :key="item.id"
+            :data-playlist-item-id="item.id"
+            @dblclick="handleTrackDoubleClick(item)"
+            @contextmenu="showContextMenu($event, item.id)"
             class="group flex items-center px-2 py-1 rounded transition-colors select-none"
             :class="{
-                'bg-zinc-200 dark:bg-zinc-800 text-blue-600 dark:text-blue-400': store.currentIndex === index,
-                'ring-1 ring-blue-500 bg-blue-50 dark:bg-blue-950/40': focusedPlaylistIndex === index,
-                'cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800': !isDownloading(track),
-                'cursor-not-allowed opacity-60': isDownloading(track)
+                'bg-zinc-200 dark:bg-zinc-800 text-blue-600 dark:text-blue-400': store.currentItemId === item.id,
+                'ring-1 ring-blue-500 bg-blue-50 dark:bg-blue-950/40': focusedPlaylistItemId === item.id,
+                'cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800': !isDownloading(item),
+                'cursor-not-allowed opacity-60': isDownloading(item)
             }"
         >
-            <div class="mr-2 text-zinc-400" :class="{'text-blue-500': store.currentIndex === index}">
-                <div v-if="isDownloading(track)" class="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-                <Video v-else-if="isVideo(track)" class="w-3.5 h-3.5" />
+            <div class="mr-2 text-zinc-400" :class="{'text-blue-500': store.currentItemId === item.id}">
+                <div v-if="isDownloading(item)" class="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                <Video v-else-if="isVideo(item)" class="w-3.5 h-3.5" />
                 <Music v-else class="w-3.5 h-3.5" />
             </div>
             <div class="flex-1 min-w-0">
                 <div class="truncate text-xs font-medium">
-                    {{ getTitle(track) }}
+                    {{ getTitle(item) }}
                 </div>
-                <div v-if="isDownloading(track)" class="text-[10px] text-blue-500">
+                <div v-if="isDownloading(item)" class="text-[10px] text-blue-500">
                     {{ locale === 'zh' ? '下载中...' : 'Downloading...' }}
                 </div>
-                <div v-else-if="isSourceRemote(track.source) && !track.source.Remote.cached_path" class="text-[10px] text-zinc-400">
+                <div v-else-if="item.origin.kind === 'remote' && !item.cached_path" class="text-[10px] text-zinc-400">
                     {{ locale === 'zh' ? '未下载 - 双击下载并播放' : 'Not downloaded - Double click to download' }}
                 </div>
             </div>
@@ -338,7 +321,7 @@ function clearFolderTree() {
                 :disabled="isResolvingUrl"
                 class="flex-1 px-3 py-2 text-sm rounded-md border dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white disabled:opacity-50"
                 @keyup.enter="addUrl"
-                @input="urlFeedback = ''; focusedPlaylistIndex = null"
+                @input="urlFeedback = ''; focusedPlaylistItemId = null"
             />
             <button
                 @click="addUrl"

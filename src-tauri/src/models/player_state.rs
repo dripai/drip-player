@@ -1,17 +1,21 @@
-use crate::models::playlist::{LibraryItem, PlaylistEntry, MediaType, Playlist};
+use crate::models::playlist::{
+    LibraryItem, MediaType, PlaylistDownloadStatus, PlaylistItem, PlaylistItemView, PlaylistOrigin,
+    PlaylistSnapshot,
+};
 use crate::services::audio_wrapper::AudioWrapper;
 use crate::services::persistence::PersistenceManager;
-use std::process::Child;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use serde::Serialize;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::process::Child;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize)]
 pub struct PlayerState {
     pub is_playing: bool,
     pub progress: f32,
     pub duration: f64,
-    pub current_index: Option<usize>,
+    pub current_item_id: Option<String>,
     pub current_item: Option<LibraryItem>,
 }
 
@@ -25,11 +29,10 @@ pub struct MusicPlayer {
     pub playback_start: Option<Instant>,
     pub playback_offset: Duration, // Used for seek and pause/resume accumulation
 
-    // New data model: library + playlist entries
-    pub library: Vec<LibraryItem>,
-    pub playlist_entries: Vec<PlaylistEntry>,
-    pub current_playlist_index: Option<usize>,
-    pub playlist: Playlist,
+    pub playlist_items: Vec<PlaylistItem>,
+    pub playlist_revision: u64,
+    pub current_playlist_item_id: Option<String>,
+    pub downloading_item_ids: HashSet<String>,
 
     pub audio: AudioWrapper,
     pub video_process: Option<Child>,
@@ -45,15 +48,11 @@ pub struct MusicPlayer {
 }
 
 impl MusicPlayer {
-    pub fn new() -> Self {
-        let library = PersistenceManager::load_library();
-        let playlist_entries = PersistenceManager::load_playlist_entries();
-        let mut playlist = Playlist::new();
-        // 保留对旧播放列表的读取以便迁移，但新流程使用 library + playlist_entries
-        playlist.tracks = PersistenceManager::load_playlist();
+    pub fn new() -> Result<Self, String> {
+        let playlist_state = PersistenceManager::load_playlist_state()?;
         let settings = PersistenceManager::load_settings();
 
-        Self {
+        Ok(Self {
             is_playing: false,
             progress: 0.0,
             duration: Duration::from_secs(0),
@@ -62,10 +61,10 @@ impl MusicPlayer {
             playback_start: None,
             playback_offset: Duration::from_secs(0),
 
-            library,
-            playlist_entries,
-            playlist,
-            current_playlist_index: None,
+            playlist_items: playlist_state.items,
+            playlist_revision: playlist_state.revision,
+            current_playlist_item_id: None,
+            downloading_item_ids: HashSet::new(),
 
             audio: AudioWrapper::new(),
             video_process: None,
@@ -73,6 +72,43 @@ impl MusicPlayer {
             current_media_type: None,
             temporary_item: None,
             minimize_to_tray: settings.minimize_to_tray,
+        })
+    }
+
+    pub fn playlist_snapshot(&self) -> PlaylistSnapshot {
+        let items = self
+            .playlist_items
+            .iter()
+            .map(|item| {
+                let download_status = if self.downloading_item_ids.contains(&item.id) {
+                    PlaylistDownloadStatus::Downloading
+                } else if matches!(item.origin, PlaylistOrigin::Local { .. })
+                    || item
+                        .cached_path
+                        .as_ref()
+                        .map(|path| path.exists())
+                        .unwrap_or(false)
+                {
+                    PlaylistDownloadStatus::Downloaded
+                } else {
+                    PlaylistDownloadStatus::NotDownloaded
+                };
+                PlaylistItemView {
+                    id: item.id.clone(),
+                    canonical_key: item.canonical_key.clone(),
+                    title: item.title.clone(),
+                    media_type: item.media_type.clone(),
+                    origin: item.origin.clone(),
+                    cached_path: item.cached_path.clone(),
+                    download_status,
+                    added_at: item.added_at,
+                }
+            })
+            .collect();
+
+        PlaylistSnapshot {
+            revision: self.playlist_revision,
+            items,
         }
     }
 }

@@ -8,9 +8,7 @@ interface Props {
   item: LibraryItem
   level: number
   expandedFolders: Set<string>
-  currentIndex: number | null
   currentTrack?: ResolvedTrack | null
-  playlist: ResolvedTrack[]
 }
 
 const props = defineProps<Props>()
@@ -34,9 +32,6 @@ function getFileName(path: string) {
 }
 
 function getTrackLabel(trackItem: ResolvedTrack) {
-  if (isSourceRemote(trackItem.source) && trackItem.source.Remote.cached_path) {
-    return getFileName(trackItem.source.Remote.cached_path)
-  }
   if (trackItem.title) {
     return trackItem.title
   }
@@ -96,9 +91,7 @@ function onPlayTrack() {
           :item="child"
           :level="level + 1"
           :expanded-folders="expandedFolders"
-          :current-index="currentIndex"
           :current-track="currentTrack"
-          :playlist="playlist"
           @toggle-folder="emit('toggle-folder', $event)"
           @play-track="emit('play-track', $event)"
         />

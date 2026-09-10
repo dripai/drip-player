@@ -52,6 +52,6 @@ CREATE TABLE app_settings (
     minimize_to_tray INTEGER NOT NULL CHECK (minimize_to_tray IN (0, 1))
 ) STRICT;
 INSERT INTO app_settings (id, revision, theme, language, play_mode, minimize_to_tray)
-VALUES (1, 0, 'auto', 'zh', 'sequential', 0);
+VALUES (1, 0, 'dark', 'zh', 'sequential', 0);
 
 PRAGMA user_version = 2;

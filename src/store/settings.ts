@@ -22,7 +22,7 @@ export type SettingsPatch = Partial<Omit<AppSettings, 'revision' | 'download_dir
 export const useSettingsStore = defineStore('settings', () => {
   // Bootstrap display values only; controls mount after SQLite has been read.
   const data = ref<AppSettings>({
-    revision: -1, theme: 'auto', language: 'zh', play_mode: 'sequential', minimize_to_tray: false,
+    revision: -1, theme: 'dark', language: 'zh', play_mode: 'sequential', minimize_to_tray: false,
     download_directory: '',
   })
   const ready = ref(false)

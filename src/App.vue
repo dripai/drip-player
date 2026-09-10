@@ -149,11 +149,12 @@ watch(() => store.error, error => { if (error) displayToast(error) })
     </div>
 
     <!-- Header -->
-    <header class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-zinc-800 drag-region" data-tauri-drag-region>
-      <div class="flex items-center gap-3">
-          <img src="/icon.png" class="w-7 h-7 rounded-xs shadow-xs" :alt="t('app.title')" />
+    <header class="flex items-center justify-between gap-4 px-4 py-3 border-b border-gray-200 dark:border-zinc-800 drag-region" data-tauri-drag-region>
+      <div class="flex min-w-0 items-center gap-3" data-tauri-drag-region>
+        <img src="/icon.png" class="w-7 h-7 shrink-0 rounded-xs shadow-xs" alt="" draggable="false" data-tauri-drag-region />
+        <span class="truncate text-sm font-semibold" data-tauri-drag-region>{{ t('app.title') }}</span>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex shrink-0 items-center gap-2">
         <button @click="toggleLearning" :aria-pressed="learning.enabled" class="no-drag flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" :class="learning.enabled ? 'text-blue-600 dark:text-blue-300 bg-blue-50 dark:bg-blue-950' : ''"><BookOpen class="h-4 w-4" />影子跟读</button>
         <button @click="openDownloads" class="no-drag relative rounded-full p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800" :title="t('downloads.title')" :aria-label="downloads.activeCount ? t('downloads.activeCount', { count: downloads.activeCount }) : t('downloads.title')">
           <Download class="h-5 w-5" />

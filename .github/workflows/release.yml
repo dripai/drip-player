@@ -31,12 +31,13 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 11.6.0
+          standalone: true
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
@@ -62,8 +63,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Drip Player ${{ github.ref_name }}"
+          releaseName: "Shadow Player ${{ github.ref_name }}"
           releaseBody: |
-            Automated release for Drip Player ${{ github.ref_name }}.
+            Automated release for Shadow Player ${{ github.ref_name }}.
           releaseDraft: false
           prerelease: false

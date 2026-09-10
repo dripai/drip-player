@@ -1,11 +1,19 @@
-pub mod fs;
 pub mod audio_backend;
 pub mod audio_wrapper;
-pub mod online_resolver;
-pub mod stream_server;
-pub mod persistence;
 pub mod media_capabilities;
-pub mod playback_plan;
-pub mod toolchain;
 pub mod media_probe;
 pub mod media_remux;
+pub mod online_resolver;
+pub mod persistence;
+pub mod playback_plan;
+pub mod stream_server;
+pub mod toolchain;
+
+pub mod directory_library;
+pub mod download_process;
+pub mod download_store;
+pub mod downloads;
+pub mod learning;
+pub mod learning_models;
+pub mod media_assets;
+pub mod playback_controller;

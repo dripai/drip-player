@@ -5,16 +5,22 @@ import Sidebar from './components/Sidebar.vue'
 import Player from './components/Player.vue'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { invoke } from '@tauri-apps/api/core'
 import { check } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
-import { Moon, Sun, PanelRightOpen, PanelRightClose, Minus, Square, X, Languages } from 'lucide-vue-next'
+import { Moon, Sun, PanelRightOpen, PanelRightClose, Minus, Square, X, Languages, BookOpen, Download } from '@lucide/vue'
+import { useDownloadsStore } from './store/downloads'
+import { useLearningStore } from './store/learning'
+import LearningPanel from './components/LearningPanel.vue'
 import { useSettingsStore } from './store/settings'
 import { useI18n } from 'vue-i18n'
 
 const appWindow = getCurrentWindow()
 const store = usePlayerStore()
 const settings = useSettingsStore()
-const { locale } = useI18n()
+const learning = useLearningStore()
+const downloads = useDownloadsStore()
+const { t, locale } = useI18n()
 
 const sidebarVisible = ref(true)
 const sidebarWidth = ref(320)
@@ -22,10 +28,23 @@ const isResizing = ref(false)
 
 function minimize() { appWindow.minimize() }
 function toggleMaximize() { appWindow.toggleMaximize() }
-function closeApp() { appWindow.close() }
+function closeApp() {
+  if (learning.recording || learning.recordingStarting || learning.savingRecording || learning.pendingRecording) { displayToast('请先停止并保存当前录音'); return }
+  void appWindow.close()
+}
+
+async function toggleLearning() {
+  try { await learning.toggle() } catch (cause) { displayToast(String(cause)) }
+}
 
 function toggleSidebar() {
+  if (learning.enabled) { void toggleLearning(); sidebarVisible.value = true; return }
   sidebarVisible.value = !sidebarVisible.value
+}
+
+async function openDownloads() {
+  try { await invoke('open_downloads_window', { locale: locale.value }) }
+  catch (cause) { displayToast(String(cause)) }
 }
 
 function toggleLanguage() {
@@ -59,17 +78,14 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  learning.dispose()
   document.removeEventListener('mousemove', onMouseMove)
   document.removeEventListener('mouseup', stopResize)
 })
 
 let unlistenState: any
 let unlistenPlaylist: any
-let unlistenTrackEnded: any
-let unlistenPlaybackError: any
-let unlistenDownloadProgress: any
-let lastProgress = 0
-let trackEndedHandled = false
+let progressTimer: ReturnType<typeof setInterval> | undefined
 
 const toastMessage = ref('')
 const showToast = ref(false)
@@ -99,10 +115,6 @@ async function checkForUpdates() {
 }
 
 onMounted(async () => {
-  await store.loadPlaylist()
-  await store.syncState()
-  checkForUpdates()
-
   unlistenState = await listen('player-state-changed', () => {
     store.syncState()
   })
@@ -111,69 +123,42 @@ onMounted(async () => {
     store.loadPlaylist()
   })
 
-  unlistenTrackEnded = await listen('track-ended', () => {
-      store.syncState()
-  })
+  await store.loadPlaylist()
+  await store.refreshPlaylist()
+  await store.syncState()
+  checkForUpdates()
 
-  unlistenPlaybackError = await listen('playback-error', (event) => {
-      console.error('Playback error:', event.payload)
-      displayToast(event.payload as string)
-  })
+  // The engine owns time and completion; this poll only refreshes its snapshot.
+  progressTimer = setInterval(() => { if (store.session) void store.syncState() }, 250)
 
-  unlistenDownloadProgress = await listen('download-progress', (event) => {
-      console.log('Download progress:', event.payload)
-      displayToast(event.payload as string)
-  })
-
-  // Poll progress and handle track end for audio
-  setInterval(() => {
-    if (store.isPlaying) {
-        store.syncState()
-
-        // Check if audio track ended (progress >= 0.99 and was playing)
-        if (store.progress >= 0.99 && lastProgress < 0.99 && !trackEndedHandled && store.duration > 0) {
-            console.log('Audio track ended, progress:', store.progress, 'play mode:', store.playMode)
-            trackEndedHandled = true
-            const nextItemId = store.getNextItemId()
-            if (nextItemId !== null) {
-                store.play(nextItemId)
-            } else {
-                store.isPlaying = false
-            }
-        }
-        lastProgress = store.progress
-    }
-  }, 500)
-
-  // Reset trackEndedHandled when track changes
-  watch(() => store.currentItemId, () => {
-    trackEndedHandled = false
-    lastProgress = 0
-  })
 })
 
 onUnmounted(() => {
   if (unlistenState) unlistenState()
   if (unlistenPlaylist) unlistenPlaylist()
-  if (unlistenTrackEnded) unlistenTrackEnded()
-  if (unlistenPlaybackError) unlistenPlaybackError()
-  if (unlistenDownloadProgress) unlistenDownloadProgress()
+  if (progressTimer) clearInterval(progressTimer)
 })
+watch(() => store.error, error => { if (error) displayToast(error) })
 </script>
 
 <template>
   <div class="flex flex-col h-screen bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 transition-colors duration-200">
     <!-- Toast -->
-    <div v-if="showToast" class="fixed top-16 right-4 z-50 bg-red-500 text-white px-4 py-2 rounded shadow-lg transition-opacity duration-300">
+    <div v-if="showToast" class="fixed top-16 right-4 z-50 bg-red-500 text-white px-4 py-2 rounded-sm shadow-lg transition-opacity duration-300">
         {{ toastMessage }}
     </div>
 
     <!-- Header -->
-    <header class="flex items-center justify-between px-4 py-3 border-b dark:border-zinc-800 drag-region" data-tauri-drag-region>
+    <header class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-zinc-800 drag-region" data-tauri-drag-region>
       <div class="flex items-center gap-3">
-          <img src="/icon.png" class="w-7 h-7 rounded-sm shadow-sm" alt="Logo" />
+          <img src="/icon.png" class="w-7 h-7 rounded-xs shadow-xs" :alt="t('app.title')" />
       </div>
       <div class="flex items-center gap-2">
+        <button @click="toggleLearning" :aria-pressed="learning.enabled" class="no-drag flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" :class="learning.enabled ? 'text-blue-600 dark:text-blue-300 bg-blue-50 dark:bg-blue-950' : ''"><BookOpen class="h-4 w-4" />影子跟读</button>
+        <button @click="openDownloads" class="no-drag relative rounded-full p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800" :title="t('downloads.title')" :aria-label="downloads.activeCount ? t('downloads.activeCount', { count: downloads.activeCount }) : t('downloads.title')">
+          <Download class="h-5 w-5" />
+          <span v-if="downloads.activeCount" class="absolute -right-1 -top-1 min-w-4 rounded-full bg-blue-600 px-1 text-center text-[10px] leading-4 text-white">{{ downloads.activeCount > 99 ? '99+' : downloads.activeCount }}</span>
+        </button>
         <button @click="toggleSidebar" class="no-drag p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
           <PanelRightClose v-if="sidebarVisible" class="w-5 h-5" />
           <PanelRightOpen v-else class="w-5 h-5" />
@@ -200,11 +185,12 @@ onUnmounted(() => {
     </header>
 
     <div class="flex flex-1 overflow-hidden relative">
-        <Player class="flex-1" />
+        <Player class="min-w-0 flex-1" />
+        <LearningPanel v-if="learning.enabled" />
 
         <!-- Resize Handle -->
         <div
-          v-if="sidebarVisible"
+          v-if="sidebarVisible && !learning.enabled"
           @mousedown="startResize"
           class="w-1 cursor-col-resize hover:bg-blue-500 transition-colors bg-zinc-200 dark:bg-zinc-800 relative z-10"
           :class="{ 'bg-blue-500': isResizing }"
@@ -213,9 +199,9 @@ onUnmounted(() => {
         <!-- Sidebar -->
         <transition name="slide">
           <Sidebar
-            v-if="sidebarVisible"
+            v-if="sidebarVisible && !learning.enabled"
             :style="{ width: sidebarWidth + 'px' }"
-            class="border-l dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50"
+            class="border-l border-gray-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50"
           />
         </transition>
     </div>

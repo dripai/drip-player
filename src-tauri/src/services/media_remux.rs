@@ -1,17 +1,36 @@
 use crate::services::toolchain;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 const REMUX_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const REMUX_CACHE_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+fn output_lock(path: &Path) -> Result<Arc<Mutex<()>>, String> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|error| error.to_string())?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
 pub fn ensure_mp4_remux(input: &Path) -> Result<PathBuf, String> {
     cleanup_remux_cache();
 
     let output = remux_output_path(input)?;
+    let output_lock = output_lock(&output)?;
+    let _preparing = output_lock.lock().map_err(|error| error.to_string())?;
     if output.exists() {
         touch_cache_file(&output);
         return Ok(output);
@@ -22,6 +41,18 @@ pub fn ensure_mp4_remux(input: &Path) -> Result<PathBuf, String> {
             .map_err(|e| format!("Failed to create remux cache dir: {}", e))?;
     }
 
+    // FFmpeg writes a private file. Only a completed remux becomes visible to other sessions.
+    let pending = tempfile::Builder::new()
+        .prefix(".shadow-remux-")
+        .suffix(".part")
+        .tempfile_in(
+            output
+                .parent()
+                .ok_or("Remux output has no parent directory")?,
+        )
+        .map_err(|error| error.to_string())?
+        .into_temp_path();
+
     let status = toolchain::hidden_command(&toolchain::tool_path("ffmpeg"))
         .arg("-y")
         .arg("-i")
@@ -30,22 +61,25 @@ pub fn ensure_mp4_remux(input: &Path) -> Result<PathBuf, String> {
         .args(["-map", "0:a:0?"])
         .args(["-c", "copy"])
         .args(["-movflags", "+faststart"])
-        .arg(&output)
+        .args(["-f", "mp4"])
+        .arg(&pending)
         .status()
         .map_err(|e| format!("Failed to start ffmpeg remux: {}", e))?;
 
     if status.success() {
+        pending
+            .persist_noclobber(&output)
+            .map_err(|error| format!("Cannot publish remux: {error}"))?;
         touch_cache_file(&output);
         Ok(output)
     } else {
-        let _ = std::fs::remove_file(&output);
         Err(format!("ffmpeg remux failed for {}", input.display()))
     }
 }
 
 fn remux_output_path(input: &Path) -> Result<PathBuf, String> {
-    let metadata = std::fs::metadata(input)
-        .map_err(|e| format!("Failed to read media metadata: {}", e))?;
+    let metadata =
+        std::fs::metadata(input).map_err(|e| format!("Failed to read media metadata: {}", e))?;
     let modified = metadata
         .modified()
         .ok()

@@ -1,8 +1,4 @@
 packages:
   - "."
-
-allowBuilds:
-  esbuild: false
-  vue-demi: false
-ignoredBuiltDependencies:
-  - mpv.js
+minimumReleaseAgeExclude:
+  - '@lucide/vue@1.44.0'

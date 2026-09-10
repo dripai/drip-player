@@ -1,336 +1,227 @@
-use rodio::{OutputStream, Sink, Decoder, OutputStreamHandle, Source};
+use crate::services::{media_probe, toolchain};
+use rodio::{
+    ChannelCount, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, SampleRate, Source,
+};
 use std::fs::File;
-use std::io::{BufReader, Read, Cursor};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
 use std::time::Duration;
-use std::sync::{Arc, Mutex, mpsc};
-use std::process::{Command, Stdio, Child};
-use crate::services::online_resolver::OnlineResolver;
-use crate::services::toolchain;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-/// Create a Command that hides the console window on Windows
-#[cfg(windows)]
-fn hidden_command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd
-}
-
-#[cfg(not(windows))]
-fn hidden_command(program: &str) -> Command {
-    Command::new(program)
-}
-
-fn get_duration_with_ffprobe(path: &Path) -> Option<Duration> {
-    let ffprobe_cmd = toolchain::tool_path("ffprobe");
-    println!("Getting duration with ffprobe: {} for {:?}", ffprobe_cmd, path);
-
-    let output = hidden_command(&ffprobe_cmd)
-        .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let duration_str = String::from_utf8_lossy(&output.stdout);
-        let duration_secs: f64 = duration_str.trim().parse().ok()?;
-        println!("Duration from ffprobe: {} seconds", duration_secs);
-        Some(Duration::from_secs_f64(duration_secs))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        println!("ffprobe failed: {}", stderr);
-        None
-    }
-}
 
 struct FfmpegSource {
-    _child: Child,
-    reader: Box<dyn Read + Send>,
+    child: Child,
+    reader: BufReader<std::process::ChildStdout>,
 }
-
 impl Iterator for FfmpegSource {
-    type Item = i16;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut buf = [0u8; 2];
-        match self.reader.read_exact(&mut buf) {
-            Ok(_) => Some(i16::from_le_bytes(buf)),
-            Err(_) => None,
-        }
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let mut sample = [0; 4];
+        self.reader.read_exact(&mut sample).ok()?;
+        Some(f32::from_le_bytes(sample))
     }
 }
-
 impl Source for FfmpegSource {
-    fn current_frame_len(&self) -> Option<usize> {
+    fn current_span_len(&self) -> Option<usize> {
         None
     }
-
-    fn channels(&self) -> u16 {
-        2
+    fn channels(&self) -> ChannelCount {
+        rodio::math::nz!(2)
     }
-
-    fn sample_rate(&self) -> u32 {
-        44100
+    fn sample_rate(&self) -> SampleRate {
+        rodio::math::nz!(44100)
     }
-
     fn total_duration(&self) -> Option<Duration> {
         None
     }
 }
-
-pub struct AudioBackend {
-    _stream: OutputStream,
-    stream_handle: OutputStreamHandle,
-    sink: Sink,
-    pub duration: Arc<Mutex<Duration>>,
-    current_path: Option<PathBuf>,
+impl Drop for FfmpegSource {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
+pub struct AudioBackend {
+    player: Player,
+    output: MixerDeviceSink,
+    position_offset: f64,
+    duration: f64,
+    path: Option<PathBuf>,
+    volume: f32,
+}
 impl AudioBackend {
-    pub fn new() -> Self {
-        let (stream, stream_handle) = OutputStream::try_default().unwrap();
-        let sink = Sink::try_new(&stream_handle).unwrap();
-        Self {
-            _stream: stream,
-            stream_handle,
-            sink,
-            duration: Arc::new(Mutex::new(Duration::from_secs(0))),
-            current_path: None,
-        }
+    pub fn new() -> Result<Self, String> {
+        let output = DeviceSinkBuilder::from_default_device()
+            .and_then(|builder| builder.open_stream())
+            .map_err(|error| format!("Audio output unavailable: {error}"))?;
+        let player = Player::connect_new(output.mixer());
+        Ok(Self {
+            player,
+            output,
+            position_offset: 0.0,
+            duration: 0.0,
+            path: None,
+            volume: 1.0,
+        })
     }
-
-    pub fn play_file(&mut self, path: &Path) -> Result<Option<Duration>, String> {
-        self.current_path = Some(path.to_path_buf());
-
-        // Stop current track
-        if !self.sink.empty() {
-            self.sink.stop();
-            // Re-create sink to ensure clean state
-            self.sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
-        }
-
-        // Try to get duration with ffprobe first (works for all formats)
-        let ffprobe_duration = get_duration_with_ffprobe(path);
-        if let Some(d) = ffprobe_duration {
-            *self.duration.lock().unwrap() = d;
-        }
-
-        // Try native rodio decoding first
-        if let Ok(file) = File::open(path) {
-            let reader = BufReader::new(file);
-
-            // Catch panic from Decoder::new
-            let decoder_result = std::panic::catch_unwind(move || {
-                Decoder::new(reader)
-            });
-
-            match decoder_result {
-                Ok(Ok(source)) => {
-                    // Use rodio duration if ffprobe didn't work
-                    if ffprobe_duration.is_none() {
-                        if let Some(d) = source.total_duration() {
-                            *self.duration.lock().unwrap() = d;
-                        }
-                    }
-                    self.sink.append(source);
-                    self.sink.play();
-                    return Ok(ffprobe_duration);
-                },
-                Ok(Err(e)) => {
-                    println!("Error decoding file with rodio {:?}: {}. Switching to FFmpeg audio path.", path, e);
-                    self.play_with_ffmpeg(path)?;
-                },
-                Err(e) => {
-                    println!("Panic decoding file with rodio {:?}: {:?}. Switching to FFmpeg audio path.", path, e);
-                    self.play_with_ffmpeg(path)?;
-                }
+    pub fn load(&mut self, path: PathBuf) -> Result<(), String> {
+        self.stop();
+        self.duration = media_probe::duration(&path)
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+        self.path = Some(path.clone());
+        self.load_at(&path, Duration::ZERO)
+    }
+    fn load_at(&mut self, path: &Path, offset: Duration) -> Result<(), String> {
+        self.player.stop();
+        self.player = Player::connect_new(self.output.mixer());
+        self.player.pause();
+        self.player.set_volume(self.volume);
+        self.position_offset = offset.as_secs_f64();
+        let file = File::open(path)
+            .map_err(|error| format!("Cannot open audio {}: {error}", path.display()))?;
+        let decoded = std::panic::catch_unwind(|| Decoder::try_from(file));
+        if let Ok(Ok(source)) = decoded {
+            if self.duration == 0.0 {
+                self.duration = source
+                    .total_duration()
+                    .map(|value| value.as_secs_f64())
+                    .unwrap_or(0.0);
             }
+            self.player.append(source.skip_duration(offset));
         } else {
-            // Probably a URL or unreadable file, use FFmpeg.
-            self.play_with_ffmpeg(path)?;
-        }
-        Ok(ffprobe_duration)
-    }
-
-    fn play_with_ffmpeg(&mut self, path: &Path) -> Result<(), String> {
-        let ffmpeg_cmd = OnlineResolver::get_ffmpeg_path()
-            .ok_or_else(|| format!("FFmpeg not found in {}", toolchain::diagnostic_lib_dir().display()))?;
-
-        println!("Spawning ffmpeg for playback: {} -i {:?}", ffmpeg_cmd, path);
-
-        let mut child = hidden_command(&ffmpeg_cmd)
-            .arg("-i")
-            .arg(path)
-            .arg("-f")
-            .arg("s16le")
-            .arg("-ac")
-            .arg("2")
-            .arg("-ar")
-            .arg("44100")
-            .arg("-vn")
-            .arg("-")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("无法播放: 启动 FFmpeg 失败 {}", e))?;
-
-        if let Some(mut stdout) = child.stdout.take() {
-            // Implement 5s timeout check for network streams
-            let (tx, rx) = mpsc::channel();
-            
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096]; // Read a chunk
-                match stdout.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        let _ = tx.send(Ok((buf[..n].to_vec(), stdout)));
-                    },
-                    Ok(_) => {
-                        let _ = tx.send(Err("EOF immediately".to_string()));
-                    },
-                    Err(e) => {
-                        let _ = tx.send(Err(e.to_string()));
-                    }
-                }
-            });
-
-            // Wait for initial data or error
-            match rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok((initial_data, rest_stdout))) => {
-                    // Successfully received data
-                    // Create a composite reader: initial data + rest of stdout
-                    let reader = Cursor::new(initial_data).chain(rest_stdout);
-                    
-                    let source = FfmpegSource {
-                        _child: child,
-                        reader: Box::new(reader),
-                    };
-                    
-                    self.sink.append(source);
-                    self.sink.play();
-                    Ok(())
-                },
-                Ok(Err(e)) => {
-                    let _ = child.kill();
-                    Err(format!("无法播放: {}", e))
-                },
-                Err(_) => {
-                    // Timeout
-                    let _ = child.kill();
-                    Err("无法播放: 连接超时 (5秒)".to_string())
-                }
-            }
-        } else {
-            let _ = child.kill();
-            Err("无法播放: 无法获取输出流".to_string())
-        }
-    }
-
-    pub fn pause(&self) {
-        self.sink.pause();
-    }
-
-    pub fn resume(&self) {
-        self.sink.play();
-    }
-    
-    pub fn stop(&self) {
-        self.sink.stop();
-    }
-    
-    pub fn set_volume(&self, volume: f32) {
-        self.sink.set_volume(volume);
-    }
-
-    pub fn play_file_from(&mut self, path: &Path, offset: Duration) {
-        // Stop current track
-        if !self.sink.empty() {
-            self.sink.stop();
-            self.sink = Sink::try_new(&self.stream_handle).unwrap();
-        }
-
-        // Try native rodio decoding first
-        if let Ok(file) = File::open(path) {
-            let reader = BufReader::new(file);
-            
-            let decoder_result = std::panic::catch_unwind(move || {
-                Decoder::new(reader)
-            });
-
-            match decoder_result {
-                Ok(Ok(source)) => {
-                    self.sink.append(source.skip_duration(offset));
-                    self.sink.play();
-                    return;
-                },
-                Ok(Err(e)) => {
-                    println!("Error decoding file with rodio for seek: {}. Switching to FFmpeg audio path.", e);
-                },
-                Err(e) => {
-                    println!("Panic decoding file with rodio for seek: {:?}. Switching to FFmpeg audio path.", e);
-                }
-            }
-        }
-        
-        self.play_with_ffmpeg_at(path, offset);
-    }
-
-    fn play_with_ffmpeg_at(&mut self, path: &Path, offset: Duration) {
-        if let Some(ffmpeg) = OnlineResolver::get_ffmpeg_path() {
-            let mut cmd = hidden_command(&ffmpeg);
-            
-            if offset.as_secs() > 0 {
-                cmd.arg("-ss").arg(format!("{}", offset.as_secs_f32()));
-            }
-            
-            let child = cmd
+            // Preserve the existing FFmpeg decoder for formats rodio cannot decode.
+            let mut child = toolchain::hidden_command(&toolchain::tool_path("ffmpeg"))
+                .args(["-v", "error", "-ss"])
+                .arg(offset.as_secs_f64().to_string())
                 .arg("-i")
                 .arg(path)
-                .arg("-f")
-                .arg("s16le")
-                .arg("-ac")
-                .arg("2")
-                .arg("-ar")
-                .arg("44100")
-                .arg("-acodec")
-                .arg("pcm_s16le")
-                .arg("-")
+                .args(["-f", "f32le", "-ac", "2", "-ar", "44100", "-vn", "-"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .spawn();
-
-            match child {
-                Ok(mut child) => {
-                    if let Some(stdout) = child.stdout.take() {
-                        let source = FfmpegSource {
-                            _child: child,
-                            reader: Box::new(BufReader::new(stdout)),
-                        };
-                        self.sink.append(source);
-                        self.sink.play();
-                    }
-                },
-                Err(e) => println!("Failed to spawn ffmpeg: {}", e),
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            let stdout = child.stdout.take().ok_or("FFmpeg has no audio output")?;
+            let mut reader = BufReader::new(stdout);
+            match reader.fill_buf() {
+                Ok(bytes) if !bytes.is_empty() => {}
+                Ok(_) => {
+                    let status = child.wait().map_err(|error| error.to_string())?;
+                    return Err(format!("FFmpeg produced no audio: {status}"));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("Cannot read FFmpeg audio: {error}"));
+                }
             }
+            self.player.append(FfmpegSource { child, reader });
         }
+        Ok(())
     }
+    pub fn seek(&mut self, position: f64) -> Result<(), String> {
+        let path = self.path.clone().ok_or("No audio loaded")?;
+        let paused = self.player.is_paused();
+        self.load_at(&path, Duration::from_secs_f64(position))?;
+        if !paused {
+            self.player.play();
+        }
+        Ok(())
+    }
+    pub fn pause(&self) {
+        self.player.pause();
+    }
+    pub fn resume(&self) {
+        self.player.play();
+    }
+    pub fn stop(&self) {
+        self.player.stop();
+    }
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume;
+        self.player.set_volume(volume);
+    }
+    pub fn position(&self) -> f64 {
+        // Rodio tracks consumed audio; device buffering can lead actual speaker output.
+        self.position_offset + self.player.get_pos().as_secs_f64()
+    }
+    pub fn duration(&self) -> f64 {
+        self.duration
+    }
+    pub fn ended(&self) -> bool {
+        self.player.empty()
+    }
+    pub fn paused(&self) -> bool {
+        self.player.is_paused()
+    }
+}
 
-    pub fn seek(&mut self, time: Duration) {
-        if let Some(path) = self.current_path.clone() {
-            self.play_file_from(&path, time);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "requires the bundled FFmpeg tools and an audio output device; playback is muted"]
+    fn muted_audio_play_pause_seek_and_complete() {
+        toolchain::set_resource_dir(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut audio = AudioBackend::new().expect("audio output device");
+        audio.set_volume(0.0);
+        for extension in ["wav", "opus"] {
+            let path = dir.path().join(format!("silent.{extension}"));
+            let result = toolchain::hidden_command(&toolchain::tool_path("ffmpeg"))
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=44100:cl=stereo",
+                    "-t",
+                    "2",
+                ])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            audio.load(path).unwrap();
+            assert!(audio.paused());
+            assert!((audio.duration() - 2.0).abs() < 0.1);
+            audio.resume();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while audio.position() < 0.1 && Instant::now() < deadline {
+                sleep(Duration::from_millis(10));
+            }
+            assert!(audio.position() >= 0.1, "{extension}: no playback progress");
+            audio.pause();
+            sleep(Duration::from_millis(100));
+            let paused_position = audio.position();
+            sleep(Duration::from_millis(100));
+            assert!(
+                (audio.position() - paused_position).abs() < 0.03,
+                "{extension}: advanced while paused"
+            );
+            audio.seek(1.0).unwrap();
+            assert!(audio.paused());
+            assert!((audio.position() - 1.0).abs() < 0.03);
+            audio.resume();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !audio.ended() && Instant::now() < deadline {
+                sleep(Duration::from_millis(10));
+            }
+            assert!(audio.ended(), "{extension}: did not finish");
+            assert!(audio.position() > 1.8, "{extension}: lost final position");
         }
-    }
-    
-    pub fn get_duration(&self) -> Duration {
-        *self.duration.lock().unwrap()
     }
 }

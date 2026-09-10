@@ -1,0 +1,17 @@
+[
+  {
+    "concept": "A",
+    "mode": "built-in image_gen",
+    "prompt": "Use case: logo-brand.\nAsset type: preview concept A for a desktop media and language-shadowing app called Shadow Player.\nCreate a single original app-icon concept, square composition. Large centered rounded-square tile in solid indigo #4F46E5 on a plain near-white background, generous even margin. Inside it, one bold white softly rounded right-pointing play triangle, plus one pale lavender #A5B4FC echo silhouette offset slightly left and down behind it. Shapes overlap substantially to read as one play mark with a following shadow, not a fast-forward symbol. Flat vector-like graphic, precise geometry, balanced negative space, crisp clean edges, excellent small-size silhouette. Only two overlapping play forms, minimal and refined. No text, no letters, no watermark, no gradients, no bevel, no 3D, no glow, no drop shadow, no mockup objects. This is a new brand exploration, not an edit of the existing D logo."
+  },
+  {
+    "concept": "B",
+    "mode": "built-in image_gen",
+    "prompt": "Use case: logo-brand.\nAsset type: preview concept B for a desktop media and language-shadowing app called Shadow Player.\nCreate a single original app-icon concept, square composition. Large centered rounded-square tile in solid indigo #4F46E5 on a plain near-white background, generous even margin. The symbol is a compact distinctive audio echo: a short white waveform built from exactly three bold rounded vertical strokes of graduated height, followed by one offset pale lavender #A5B4FC three-stroke echo, with a thoughtful interlocking rhythm and balanced spacing. Suggest original speech followed by the user's repeated speech. Broad readable shapes, not a dense equalizer. Flat vector-like graphic, precise geometry, balanced negative space, crisp clean edges, clear at small size. No play triangle in this version. No text, no letters, no watermark, no gradients, no bevel, no 3D, no glow, no drop shadow, no mockup objects. This is a new brand exploration."
+  },
+  {
+    "concept": "C",
+    "mode": "built-in image_gen",
+    "prompt": "Use case: logo-brand.\nAsset type: preview concept C for a desktop media and language-shadowing app called Shadow Player.\nCreate a single original app-icon concept, square composition. Large centered rounded-square tile in solid indigo #4F46E5 on a plain near-white background, generous even margin. Inside is a bold abstract white letter S monogram formed as a simple continuous geometric ribbon; the central negative space subtly forms a right-pointing play triangle. Add at most one restrained pale lavender #A5B4FC offset echo edge to express a shadow. It should read as a compact memorable S/play symbol, not two disconnected shapes. Flat vector-like graphic, precise geometry, balanced negative space, crisp clean edges, suitable for a desktop app and small sizes. No wordmark, no other letters, no watermark, no gradients, no bevel, no 3D, no glow, no drop shadow, no mockup objects. This is a new brand exploration."
+  }
+]

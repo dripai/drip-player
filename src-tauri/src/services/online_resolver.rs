@@ -1,9 +1,9 @@
-use std::process::{Command, Stdio};
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::io::{BufRead, BufReader};
-use crate::models::playlist::MediaType;
+use crate::models::media::MediaType;
+use crate::services::download_process::{run_command, DownloadControl};
 use crate::services::toolchain;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -17,35 +17,6 @@ enum AuthStrategy {
     None,
     /// Use cookies from browser (chrome, edge, firefox)
     Browser(&'static str),
-    /// Use cookies file
-    #[allow(dead_code)]
-    CookiesFile(PathBuf),
-    /// Use OAuth2 authentication (for YouTube)
-    OAuth2,
-}
-
-/// Error types for video resolution
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ResolveError {
-    /// Login required - user needs to authenticate
-    LoginRequired {
-        platform: String,
-        login_url: String,
-        message: String,
-    },
-    /// General error
-    GeneralError(String),
-}
-
-impl std::fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResolveError::LoginRequired { platform, message, .. } => {
-                write!(f, "{} 需要登录: {}", platform, message)
-            }
-            ResolveError::GeneralError(msg) => write!(f, "{}", msg),
-        }
-    }
 }
 
 /// Supported video platforms with their specific configurations
@@ -53,10 +24,10 @@ impl std::fmt::Display for ResolveError {
 pub enum VideoPlatform {
     Bilibili,
     YouTube,
-    Douyin,      // 抖音
+    Douyin,       // 抖音
     TencentVideo, // 腾讯视频
-    Weixin,      // 微信视频号
-    Generic,     // 通用/其他平台
+    Weixin,       // 微信视频号
+    Generic,      // 通用/其他平台
 }
 
 impl VideoPlatform {
@@ -72,7 +43,9 @@ impl VideoPlatform {
             VideoPlatform::Douyin
         } else if url_lower.contains("v.qq.com") || url_lower.contains("qq.com/x/cover") {
             VideoPlatform::TencentVideo
-        } else if url_lower.contains("channels.weixin.qq.com") || url_lower.contains("finder.video.qq.com") {
+        } else if url_lower.contains("channels.weixin.qq.com")
+            || url_lower.contains("finder.video.qq.com")
+        {
             VideoPlatform::Weixin
         } else {
             VideoPlatform::Generic
@@ -106,9 +79,9 @@ impl VideoPlatform {
     /// Check if this platform typically requires cookies for full access
     pub fn needs_cookies(&self) -> bool {
         match self {
-            VideoPlatform::Bilibili => true,  // For high quality
-            VideoPlatform::YouTube => true,   // For age-restricted content
-            VideoPlatform::Douyin => true,    // Often needs login
+            VideoPlatform::Bilibili => true, // For high quality
+            VideoPlatform::YouTube => true,  // For age-restricted content
+            VideoPlatform::Douyin => true,   // Often needs login
             VideoPlatform::TencentVideo => true,
             VideoPlatform::Weixin => true,
             VideoPlatform::Generic => false,
@@ -135,7 +108,10 @@ impl VideoPlatform {
             Some(VideoPlatform::Bilibili)
         } else if url_lower.contains("googlevideo.com") || url_lower.contains("youtube") {
             Some(VideoPlatform::YouTube)
-        } else if url_lower.contains("douyinvod") || url_lower.contains("bytedance") || url_lower.contains("amemv") {
+        } else if url_lower.contains("douyinvod")
+            || url_lower.contains("bytedance")
+            || url_lower.contains("amemv")
+        {
             Some(VideoPlatform::Douyin)
         } else if url_lower.contains("v.qq.com") || url_lower.contains("gtimg.com") {
             Some(VideoPlatform::TencentVideo)
@@ -148,15 +124,11 @@ impl VideoPlatform {
 #[derive(Deserialize, Debug, Clone)]
 pub struct VideoMetadata {
     pub title: String,
-    pub duration: Option<f64>, // seconds
     pub id: String,
     pub vcodec: Option<String>,
-    #[allow(dead_code)]
-    pub webpage_url: String,
 }
 
 impl VideoMetadata {
-    #[allow(dead_code)]
     pub fn get_media_type(&self) -> MediaType {
         match &self.vcodec {
             Some(v) if v != "none" => MediaType::Video,
@@ -166,6 +138,14 @@ impl VideoMetadata {
 }
 
 pub struct OnlineResolver;
+
+pub struct DownloadRequest<'a> {
+    pub url: &'a str,
+    pub title: &'a str,
+    pub output_dir: &'a Path,
+    pub media_type: &'a MediaType,
+    pub extra_subtitle_lang: Option<&'a str>,
+}
 
 /// Create a Command that hides the console window on Windows
 #[cfg(windows)]
@@ -193,7 +173,14 @@ impl OnlineResolver {
             let take = (max_len - 1) / 2;
             let end_take = max_len - 1 - take;
             let start: String = s.chars().take(take).collect();
-            let end: String = s.chars().rev().take(end_take).collect::<String>().chars().rev().collect();
+            let end: String = s
+                .chars()
+                .rev()
+                .take(end_take)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             format!("{}…{}", start, end)
         }
 
@@ -233,8 +220,8 @@ impl OnlineResolver {
     }
     pub fn get_tools_paths() -> (String, Option<String>) {
         let yt_dlp_cmd = toolchain::tool_path("yt-dlp");
-        let ffmpeg_cmd = toolchain::tool_dir_for("ffmpeg")
-            .map(|dir| dir.to_string_lossy().to_string());
+        let ffmpeg_cmd =
+            toolchain::tool_dir_for("ffmpeg").map(|dir| dir.to_string_lossy().to_string());
         (yt_dlp_cmd, ffmpeg_cmd)
     }
 
@@ -250,95 +237,22 @@ impl OnlineResolver {
         toolchain::find_tool("ffmpeg").map(|path| path.to_string_lossy().to_string())
     }
 
-    pub fn get_stream_url(url: &str) -> Result<String, String> {
+    pub fn resolve_metadata(url: &str, control: &DownloadControl) -> Result<VideoMetadata, String> {
         let (yt_dlp_cmd, _) = Self::get_tools_paths();
         let platform = VideoPlatform::from_url(url);
 
-        println!("Resolving stream URL for platform: {} ({})", platform.display_name(), url);
-
-        // Use the same strategies as resolve_metadata to bypass 412 errors
-        let strategies = if platform.needs_cookies() {
-            vec![
-                AuthStrategy::Browser("chrome"),
-                AuthStrategy::Browser("edge"),
-                AuthStrategy::Browser("firefox"),
-                AuthStrategy::None
-            ]
-        } else {
-            vec![AuthStrategy::None]
-        };
-        let mut last_error = String::new();
-
-        for strategy in strategies {
-            let mut cmd = hidden_command(&yt_dlp_cmd);
-            cmd.args(&[
-                "-g",
-                "-f", "best[ext=mp4]/best",
-                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ]);
-
-            // For YouTube, add special options to help bypass bot detection
-            if platform == VideoPlatform::YouTube {
-                cmd.arg("--extractor-args")
-                   .arg("youtube:player_client=web,default");
-            }
-
-            // Add platform-specific referer if needed
-            if let Some(referer) = platform.get_referer() {
-                cmd.args(&["--referer", referer]);
-            }
-
-            match &strategy {
-                AuthStrategy::Browser(b) => {
-                    cmd.arg("--cookies-from-browser").arg(b);
-                },
-                AuthStrategy::CookiesFile(p) => {
-                    cmd.arg("--cookies").arg(p);
-                },
-                AuthStrategy::None => {},
-                AuthStrategy::OAuth2 => {
-                    // OAuth2 handled separately
-                    continue;
-                }
-            }
-
-            let output = cmd.arg(url)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|e| format!("Failed to execute yt-dlp: {}", e))?;
-
-            if output.status.success() {
-                 let video_url = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .to_string();
-                println!("Successfully resolved stream URL for {}", platform.display_name());
-                return Ok(video_url);
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                last_error = stderr.to_string();
-                // If it's a cookie lock error, try next browser
-                if stderr.contains("Could not copy") || stderr.contains("Sign in") {
-                    continue;
-                }
-            }
-        }
-
-        Err(format!("yt-dlp failed for {} after retries: {}", platform.display_name(), last_error))
-    }
-
-    pub fn resolve_metadata(url: &str) -> Result<VideoMetadata, String> {
-        let (yt_dlp_cmd, _) = Self::get_tools_paths();
-        let platform = VideoPlatform::from_url(url);
-
-        println!("Resolving metadata for platform: {} ({})", platform.display_name(), url);
+        println!(
+            "Resolving metadata for platform: {} ({})",
+            platform.display_name(),
+            url
+        );
 
         // Strategy order:
         // 1. No auth (try without cookies first)
         // 2. Browser cookies (chrome, edge, firefox)
         // 3. If all fail and login required, return special error for OAuth/manual login
         let strategies = vec![
-            AuthStrategy::None,  // Try without auth first
+            AuthStrategy::None, // Try without auth first
             AuthStrategy::Browser("chrome"),
             AuthStrategy::Browser("edge"),
             AuthStrategy::Browser("firefox"),
@@ -347,16 +261,15 @@ impl OnlineResolver {
         let mut needs_login = false;
 
         for strategy in &strategies {
+            control.check()?;
             let strategy_name = match strategy {
                 AuthStrategy::None => "none".to_string(),
                 AuthStrategy::Browser(b) => format!("browser:{}", b),
-                AuthStrategy::CookiesFile(p) => format!("cookies:{}", p.display()),
-                AuthStrategy::OAuth2 => "oauth2".to_string(),
             };
             println!("Trying strategy: {}", strategy_name);
 
             let mut cmd = hidden_command(&yt_dlp_cmd);
-            cmd.arg("--dump-json")
+            cmd.arg("--ignore-config").arg("--encoding").arg("utf-8").arg("--dump-json")
                .arg("--no-playlist")
                .arg("--no-warnings")
                .arg("--user-agent")
@@ -365,7 +278,7 @@ impl OnlineResolver {
             // For YouTube, add special options to help bypass bot detection
             if platform == VideoPlatform::YouTube {
                 cmd.arg("--extractor-args")
-                   .arg("youtube:player_client=web,default");
+                    .arg("youtube:player_client=web,default");
             }
 
             // Add platform-specific referer if needed
@@ -374,43 +287,42 @@ impl OnlineResolver {
             }
 
             match strategy {
-                AuthStrategy::None => {},
+                AuthStrategy::None => {}
                 AuthStrategy::Browser(b) => {
                     cmd.arg("--cookies-from-browser").arg(*b);
-                },
-                AuthStrategy::CookiesFile(p) => {
-                    cmd.arg("--cookies").arg(p);
-                },
-                AuthStrategy::OAuth2 => {
-                    // OAuth2 is handled separately as it requires user interaction
                 }
             }
 
-            let output = cmd.arg(url)
-                .output()
-                .map_err(|e| format!("Failed to execute yt-dlp: {}", e))?;
+            cmd.arg(url);
+            let output = run_command(cmd, control, true, |_| Ok(()))?;
 
             if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stdout = &output.stdout;
 
                 // Try to parse each line as JSON
                 for line in stdout.lines() {
                     if let Ok(metadata) = serde_json::from_str::<VideoMetadata>(line) {
-                        println!("Successfully resolved metadata for {}: {} (strategy: {})", platform.display_name(), metadata.title, strategy_name);
+                        println!(
+                            "Successfully resolved metadata for {}: {} (strategy: {})",
+                            platform.display_name(),
+                            metadata.title,
+                            strategy_name
+                        );
                         return Ok(metadata);
                     }
                 }
 
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = &output.stderr;
                 last_error = format!("Failed to parse JSON from output. Stderr: {}", stderr);
                 println!("Strategy {} failed: {}", strategy_name, last_error);
             } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = &output.stderr;
                 last_error = stderr.to_string();
                 println!("Strategy {} failed: {}", strategy_name, last_error);
 
                 // Check if this is a login-related error
-                if stderr.contains("Sign in") || stderr.contains("bot") || stderr.contains("login") {
+                if stderr.contains("Sign in") || stderr.contains("bot") || stderr.contains("login")
+                {
                     needs_login = true;
                 }
 
@@ -425,12 +337,18 @@ impl OnlineResolver {
         // If login is needed, return special error code
         if needs_login && platform.needs_cookies() {
             // Return error that indicates OAuth should be tried
-            Err(format!("LOGIN_REQUIRED:{}:{}:{}",
+            Err(format!(
+                "LOGIN_REQUIRED:{}:{}:{}",
                 platform.display_name(),
                 platform.get_login_url(),
-                last_error))
+                last_error
+            ))
         } else {
-            Err(format!("yt-dlp error for {} after retries: {}", platform.display_name(), last_error))
+            Err(format!(
+                "yt-dlp error for {} after retries: {}",
+                platform.display_name(),
+                last_error
+            ))
         }
     }
 
@@ -443,7 +361,10 @@ impl OnlineResolver {
 
         // OAuth2 is primarily for YouTube
         if platform != VideoPlatform::YouTube {
-            return Err(format!("OAuth2 is only supported for YouTube, not {}", platform.display_name()));
+            return Err(format!(
+                "OAuth2 is only supported for YouTube, not {}",
+                platform.display_name()
+            ));
         }
 
         println!("Attempting OAuth2 authentication for YouTube...");
@@ -474,22 +395,23 @@ impl OnlineResolver {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if let Ok(metadata) = serde_json::from_str::<VideoMetadata>(line) {
-                    println!("Successfully resolved metadata with OAuth2: {}", metadata.title);
+                    println!(
+                        "Successfully resolved metadata with OAuth2: {}",
+                        metadata.title
+                    );
                     return Ok(metadata);
                 }
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("OAuth2 succeeded but failed to parse response. Stderr: {}", stderr))
+            Err(format!(
+                "OAuth2 succeeded but failed to parse response. Stderr: {}",
+                stderr
+            ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             println!("OAuth2 failed: {}", stderr);
             Err(format!("OAuth2 authentication failed: {}", stderr))
         }
-    }
-
-    /// Check if an error indicates login is required
-    pub fn is_login_required_error(error: &str) -> bool {
-        error.starts_with("LOGIN_REQUIRED:")
     }
 
     /// Parse login required error to get platform info
@@ -507,105 +429,58 @@ impl OnlineResolver {
         None
     }
 
-    pub fn download_media<F>(url: &str, id: &str, title: &str, output_dir: &Path, media_type: MediaType, extra_subtitle_lang: Option<&str>, on_progress: F) -> Result<PathBuf, String>
-    where F: Fn(String) + Send + 'static + Clone
-    {
-        let platform = VideoPlatform::from_url(url);
-
-        println!("Starting download for platform: {} ({})", platform.display_name(), url);
-
+    pub fn download_media(
+        request: &DownloadRequest<'_>,
+        control: &DownloadControl,
+        on_progress: impl Fn(&str) -> Result<(), String>,
+    ) -> Result<PathBuf, String> {
+        let platform = VideoPlatform::from_url(request.url);
         let strategies = if platform.needs_cookies() {
             vec![
                 AuthStrategy::Browser("chrome"),
                 AuthStrategy::Browser("edge"),
                 AuthStrategy::Browser("firefox"),
-                AuthStrategy::None
+                AuthStrategy::None,
             ]
         } else {
             vec![AuthStrategy::None]
         };
         let mut last_error = String::new();
-
         for strategy in strategies {
-            let res = Self::download_media_internal(url, id, title, output_dir, media_type.clone(), extra_subtitle_lang, on_progress.clone(), &strategy, &platform);
-            match res {
+            control.check()?;
+            match Self::download_media_internal(
+                request,
+                control,
+                &on_progress,
+                &strategy,
+                &platform,
+            ) {
                 Ok(path) => return Ok(path),
-                Err(e) => {
-                    last_error = e.clone();
-                    if e.contains("Could not copy") || e.contains("Sign in") {
-                        continue;
-                    }
-                    // For download, we might want to be more persistent, so just try next
+                Err(error) => {
+                    control.check()?;
+                    last_error = error;
                 }
             }
         }
-
-        Err(format!("Download failed for {} after retries: {}", platform.display_name(), last_error))
+        Err(last_error)
     }
 
-    pub fn find_existing_media(
-        output_dir: &Path,
-        id: &str,
-        title: &str,
-        media_type: &MediaType,
-    ) -> Option<PathBuf> {
-        let safe_title = Self::sanitize_filename(title);
-        let mut matches = std::fs::read_dir(output_dir)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                if !path.is_file() {
-                    return false;
-                }
-
-                let extension = path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| extension.to_lowercase());
-                let supported = match media_type {
-                    MediaType::Video => matches!(
-                        extension.as_deref(),
-                        Some("mp4" | "webm" | "mkv" | "avi" | "mov")
-                    ),
-                    MediaType::Audio => matches!(
-                        extension.as_deref(),
-                        Some("mp3" | "m4a" | "wav" | "flac" | "ogg" | "opus" | "aac")
-                    ),
-                };
-                if !supported {
-                    return false;
-                }
-
-                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                stem == safe_title
-                    || stem.starts_with(&format!("{} - ", safe_title))
-                    || file_name.contains(id)
-            })
-            .collect::<Vec<_>>();
-        matches.sort();
-        matches.into_iter().next()
-    }
-
-    fn download_media_internal<F>(url: &str, id: &str, title: &str, output_dir: &Path, media_type: MediaType, extra_subtitle_lang: Option<&str>, on_progress: F, strategy: &AuthStrategy, platform: &VideoPlatform) -> Result<PathBuf, String>
-    where F: Fn(String) + Send + 'static
-    {
-        // Check for existing file with same ID (ignoring extension)
-        if !output_dir.exists() {
-            std::fs::create_dir_all(output_dir).map_err(|e| format!("Failed to create cache dir: {}", e))?;
-        } else if let Some(path) =
-            Self::find_existing_media(output_dir, id, title, &media_type)
-        {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            on_progress(format!("File already exists: {}", name));
-            return Ok(path);
-        }
-
-        // Use template including a sanitized title only (user requested). yt-dlp will write <title>.<ext>
-        let safe_title = Self::sanitize_filename(title);
+    fn download_media_internal(
+        request: &DownloadRequest<'_>,
+        control: &DownloadControl,
+        on_progress: &impl Fn(&str) -> Result<(), String>,
+        strategy: &AuthStrategy,
+        platform: &VideoPlatform,
+    ) -> Result<PathBuf, String> {
+        let DownloadRequest {
+            url,
+            title,
+            output_dir,
+            media_type,
+            extra_subtitle_lang,
+        } = *request;
+        let safe_title = Self::sanitize_filename(title).replace('%', "%%");
         let output_template = output_dir.join(format!("{}.%(ext)s", safe_title));
-
         let (yt_dlp_cmd, ffmpeg_dir) = Self::get_tools_paths();
         let ffmpeg_dir = ffmpeg_dir.ok_or_else(|| {
             format!(
@@ -613,11 +488,7 @@ impl OnlineResolver {
                 toolchain::diagnostic_lib_dir().display()
             )
         })?;
-
         let mut cmd = hidden_command(&yt_dlp_cmd);
-
-        println!("Starting download with ffmpeg support");
-
         match media_type {
             MediaType::Video => {
                 cmd.arg("-f")
@@ -633,89 +504,152 @@ impl OnlineResolver {
                     .arg("192K");
             }
         }
-
-        cmd.arg("--embed-metadata")
-            .arg("--newline")
-            .arg("--user-agent")
-            .arg("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-
-        // Add platform-specific referer if needed
+        cmd.arg("--ignore-config").arg("--encoding").arg("utf-8")
+            .arg("--embed-metadata").arg("--newline").arg("--continue")
+            .arg("--no-simulate").arg("--progress").arg("--progress-delta").arg("0.5")
+            .arg("--progress-template").arg("download:__SHADOW_PROGRESS__%(progress)j")
+            .arg("--print").arg("after_move:__SHADOW_FILE__%(filepath)j")
+            .arg("--user-agent").arg("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         if let Some(referer) = platform.get_referer() {
             cmd.arg("--referer").arg(referer);
         }
-
-        // Add subtitle download options: default zh,en, plus optional extra language
-        // yt-dlp will skip if subtitles are not available (no error)
-        cmd.arg("--write-subs")
-            .arg("--sub-langs");
-
-        let sub_langs = if let Some(extra_lang) = extra_subtitle_lang {
-            format!("zh,en,{}", extra_lang)
-        } else {
-            "zh,en".to_string()
-        };
-        cmd.arg(&sub_langs);
-
-        match strategy {
-            AuthStrategy::Browser(b) => {
-                cmd.arg("--cookies-from-browser").arg(b);
-            },
-            AuthStrategy::CookiesFile(p) => {
-                cmd.arg("--cookies").arg(p);
-            },
-            AuthStrategy::None => {},
-            AuthStrategy::OAuth2 => {
-                // OAuth2 not used in download
-            }
+        let sub_langs = extra_subtitle_lang
+            .map(|lang| format!("zh,en,{lang}"))
+            .unwrap_or_else(|| "zh,en".into());
+        cmd.arg("--write-subs").arg("--sub-langs").arg(sub_langs);
+        if let AuthStrategy::Browser(browser) = strategy {
+            cmd.arg("--cookies-from-browser").arg(browser);
         }
-            
         cmd.arg("-o")
-            .arg(output_template.to_string_lossy().as_ref());
-            
-        cmd.arg("--ffmpeg-location").arg(ffmpeg_dir);
-            
-        let mut child = cmd.arg("--no-playlist")
+            .arg(output_template)
+            .arg("--ffmpeg-location")
+            .arg(ffmpeg_dir)
+            .arg("--no-playlist")
             .arg("--no-warnings")
-            .arg(url)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn yt-dlp: {}", e))?;
+            .arg(url);
+        let mut final_path = None;
+        let output = run_command(cmd, control, false, |line| {
+            if let Some(value) = line.strip_prefix("__SHADOW_FILE__") {
+                final_path = Some(PathBuf::from(
+                    serde_json::from_str::<String>(value)
+                        .map_err(|error| format!("Invalid download output path: {error}"))?,
+                ));
+            } else {
+                on_progress(line)?;
+            }
+            Ok(())
+        })?;
+        if !output.status.success() {
+            return Err(format!("yt-dlp: {}", output.stderr.trim()));
+        }
+        final_path.ok_or_else(|| "下载进程未返回处理完成的文件路径".into())
+    }
+}
 
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    println!("[yt-dlp] {}", line);
-                    if line.contains("[download]") {
-                        on_progress(line);
-                    }
-                }
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    struct FixtureServer {
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for FixtureServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
             }
         }
-        
-        let status = child.wait().map_err(|e| format!("Failed to wait on yt-dlp: {}", e))?;
+    }
 
-        if !status.success() {
-            let mut stderr_msg = String::new();
-            if let Some(stderr) = child.stderr.take() {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        stderr_msg.push_str(&line);
-                        stderr_msg.push('\n');
-                        println!("[yt-dlp error] {}", line);
+    #[test]
+    #[ignore = "requires bundled yt-dlp and FFmpeg; downloads a generated WAV from localhost only"]
+    fn real_tools_download_and_convert_local_http_audio() {
+        let (yt_dlp, ffmpeg) = OnlineResolver::get_tools_paths();
+        assert!(Path::new(&yt_dlp).is_file(), "bundled yt-dlp is required");
+        assert!(ffmpeg.is_some(), "bundled FFmpeg is required");
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF");
+        wav.extend(16036u32.to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(8000u32.to_le_bytes());
+        wav.extend(16000u32.to_le_bytes());
+        wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend(16000u32.to_le_bytes());
+        wav.resize(16044, 0);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/fixture.wav", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let running = stop.clone();
+        let _server = FixtureServer {
+            stop,
+            worker: Some(std::thread::spawn(move || {
+                while !running.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut bytes = [0u8; 16384];
+                            let read = stream.read(&mut bytes).unwrap();
+                            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wav.len());
+                            if stream.write_all(header.as_bytes()).is_ok()
+                                && !bytes[..read].starts_with(b"HEAD ")
+                            {
+                                let _ = stream.write_all(&wav);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("local fixture server: {error}"),
                     }
                 }
-            }
-            return Err(format!("yt-dlp download error: {}", stderr_msg));
-        }
-
-        if let Some(path) = Self::find_existing_media(output_dir, id, title, &media_type) {
-            println!("Download completed: {}", path.display());
-            Ok(path)
-        } else {
-            Err(format!("Output file not found after download for title: {}", safe_title))
-        }
+            })),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let directory = dunce::canonicalize(temp.path()).unwrap();
+        let control = DownloadControl::default();
+        let metadata = OnlineResolver::resolve_metadata(&url, &control).unwrap();
+        assert!(!metadata.title.is_empty());
+        let progress = AtomicUsize::new(0);
+        let path = OnlineResolver::download_media(
+            &DownloadRequest {
+                url: &url,
+                title: "本地下载测试 100%",
+                output_dir: &directory,
+                media_type: &MediaType::Audio,
+                extra_subtitle_lang: None,
+            },
+            &control,
+            |line| {
+                if crate::services::downloads::parse_progress(line)?.is_some() {
+                    progress.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dunce::canonicalize(&path).unwrap().parent(),
+            Some(directory.as_path())
+        );
+        assert_eq!(path.file_name().unwrap(), "本地下载测试 100%.mp3");
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        assert!(progress.load(Ordering::SeqCst) > 0);
     }
 }

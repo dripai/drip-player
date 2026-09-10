@@ -20,6 +20,7 @@ export interface LibrarySourceRemote {
 }
 
 export interface LibraryTrack {
+  media_id?: string
   id: string
   title: string
   media_type: 'Audio' | 'Video'
@@ -45,7 +46,7 @@ export interface PlaylistItem {
   media_type: 'Audio' | 'Video'
   origin: PlaylistOrigin
   cached_path?: string | null
-  download_status: 'not_downloaded' | 'downloading' | 'downloaded'
+  download_status: 'not_downloaded' | 'downloaded'
   added_at: number
 }
 
@@ -54,153 +55,129 @@ export interface PlaylistSnapshot {
   items: PlaylistItem[]
 }
 
-export interface PlayerState {
-  is_playing: boolean
-  progress: number
+export interface MediaAsset {
+  id: string
+  media_id: string
+  kind: 'playback' | 'subtitle'
+  path: string
+  language: string | null
+  source: 'local' | 'download'
+}
+
+export interface Media {
+  id: string
+  canonical_key: string
+  title: string
+  media_type: 'Audio' | 'Video'
+  origin: PlaylistOrigin
+  assets: MediaAsset[]
+}
+export type PlaybackStatus = 'preparing' | 'ready' | 'playing' | 'paused' | 'buffering' | 'ended' | 'stopped' | 'failed' | 'external'
+export interface PlaybackSession {
+  id: number
+  media: Media
+  playlist_entry_id: string | null
+  plan: { engine: 'browser_video' | 'external_video' | 'audio'; path: string } | null
+  status: PlaybackStatus
+  position: number
   duration: number
-  current_item_id: string | null
-  current_item: LibraryItem | null
+  error: string | null
 }
+export interface PlaybackSnapshot { revision: number; session: PlaybackSession | null }
 
-export interface AddUrlResult {
-  outcome: 'added' | 'already_present'
-  item_id: string
-}
-
-export function isSourceLocal(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceLocal {
-  return 'Local' in source
-}
-
-export function isSourceRemote(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceRemote {
-  return 'Remote' in source
-}
+export function isSourceLocal(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceLocal { return 'Local' in source }
+export function isSourceRemote(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceRemote { return 'Remote' in source }
 
 export const usePlayerStore = defineStore('player', {
   state: () => ({
-    playlist: [] as PlaylistItem[],
-    playlistRevision: 0,
-    isPlaying: false,
-    progress: 0,
-    duration: 0,
-    currentItemId: null as string | null,
-    currentTrack: null as ResolvedTrack | null,
+    playlist: [] as PlaylistItem[], playlistRevision: 0,
+    refreshingPlaylist: false,
+    playbackRevision: 0, session: null as PlaybackSession | null,
+    lastAdvancedSession: null as number | null,
+    learningActive: false,
+    error: '',
   }),
   getters: {
     playMode: (): PlayMode => useSettingsStore().data.play_mode,
+    isPlaying: state => state.session?.status === 'playing' || state.session?.status === 'buffering',
+    duration: state => state.session?.duration || 0,
+    progress: state => state.session && state.session.duration > 0 ? Math.min(1, state.session.position / state.session.duration) : 0,
+    currentItemId: state => state.session?.playlist_entry_id || null,
+    currentTrack: (state): ResolvedTrack | null => {
+      const media = state.session?.media
+      if (!media) return null
+      const cached = media.assets.find(asset => asset.kind === 'playback')?.path
+      const source = media.origin.kind === 'local' ? { Local: { path: media.origin.path } } : {
+        Remote: { url: media.origin.url, id: media.origin.external_id, cached_path: cached,
+          media_type: media.media_type, download_status: cached ? 'Downloaded' as const : 'NotDownloaded' as const } }
+      return { id: media.id, media_id: media.id, title: media.title, media_type: media.media_type, source }
+    },
   },
   actions: {
+    acceptPlaylist(snapshot: PlaylistSnapshot) {
+      if (snapshot.revision < this.playlistRevision) return
+      this.playlistRevision = snapshot.revision
+      this.playlist = snapshot.items
+    },
     async loadPlaylist() {
       try {
         const snapshot = await invoke<PlaylistSnapshot>('get_playlist')
-        if (snapshot.revision < this.playlistRevision) return
-        this.playlistRevision = snapshot.revision
-        this.playlist = snapshot.items
-      } catch (error) {
-        console.error('Failed to load playlist', error)
+        this.acceptPlaylist(snapshot)
+      } catch (error) { this.error = String(error) }
+    },
+    async refreshPlaylist() {
+      if (this.refreshingPlaylist) return
+      this.refreshingPlaylist = true
+      this.error = ''
+      try {
+        this.acceptPlaylist(await invoke<PlaylistSnapshot>('refresh_playlist'))
+        await this.syncState()
+      } catch (error) { this.error = String(error) }
+      finally { this.refreshingPlaylist = false }
+    },
+    acceptSnapshot(snapshot: PlaybackSnapshot) {
+      if (snapshot.revision < this.playbackRevision) return
+      this.playbackRevision = snapshot.revision
+      this.session = snapshot.session
+      if (snapshot.session?.error) this.error = snapshot.session.error
+      const session = snapshot.session
+      if (!this.learningActive && session?.status === 'ended' && session.playlist_entry_id && this.lastAdvancedSession !== session.id) {
+        this.lastAdvancedSession = session.id
+        void this.advance(false, true).catch(error => { this.error = String(error) })
       }
-    },
-
-    async play(itemId: string) {
-      const item = this.playlist.find(candidate => candidate.id === itemId)
-      if (item?.origin.kind === 'remote') {
-        await this.playRemoteTrack(itemId)
-        return
-      }
-      await invoke('play_item', { itemId })
-    },
-    async pause() {
-      await invoke('pause')
-    },
-    async resume() {
-      await invoke('resume')
-    },
-    async seek(progress: number) {
-      this.progress = progress
-      await invoke('seek', { progress })
-    },
-    async addUrl(url: string): Promise<AddUrlResult> {
-      const result = await invoke<AddUrlResult>('add_url_for_download', { url })
-      await this.loadPlaylist()
-      return result
-    },
-    async playRemoteTrack(itemId: string, extraSubtitleLang?: string) {
-      await invoke('download_and_play', {
-        itemId,
-        extraSubtitleLang: extraSubtitleLang || null,
-      })
-      await Promise.all([this.loadPlaylist(), this.syncState()])
     },
     async syncState() {
-      try {
-        const state = await invoke<PlayerState>('get_state')
-        this.isPlaying = state.is_playing
-        this.progress = state.progress
-        this.duration = state.duration
-        this.currentItemId = state.current_item_id
-        this.currentTrack = state.current_item && 'Track' in state.current_item
-          ? state.current_item.Track
-          : null
-      } catch (error) {
-        console.error('Failed to sync state', error)
+      try { this.acceptSnapshot(await invoke<PlaybackSnapshot>('get_state')) }
+      catch (error) { this.error = String(error) }
+    },
+    async play(itemId: string) {
+      this.error = ''
+      try { await invoke('play_item', { itemId }) }
+      finally { await this.syncState() }
+    },
+    async playPath(path: string) {
+      this.error = ''
+      try { await invoke('play_track_directly', { path }) }
+      finally { await this.syncState() }
+    },
+    async pause() { if (this.session) await invoke('pause', { sessionId: this.session.id }) },
+    async resume() { if (this.session) await invoke('resume', { sessionId: this.session.id }) },
+    async seek(progress: number) {
+      if (this.session) await invoke('seek', { sessionId: this.session.id, position: this.duration * progress })
+    },
+    async advance(backwards: boolean, automatic = false) {
+      if (!this.session) {
+        const entry = backwards ? this.playlist[this.playlist.length - 1] : this.playlist[0]
+        if (entry) await this.play(entry.id)
+        return
       }
+      await invoke('advance_playback', { sessionId: this.session.id, backwards, automatic })
+      await this.syncState()
     },
-    async reportPlaybackError() {
-      await invoke('on_playback_error')
+    async replay() {
+      if (this.currentItemId) await this.play(this.currentItemId)
+      else if (this.session?.media.origin.kind === 'local') await this.playPath(this.session.media.origin.path)
     },
-    async setPlayMode(mode: PlayMode) {
-      return useSettingsStore().update({ play_mode: mode })
-    },
-    getNextItemId(): string | null {
-      if (this.playlist.length === 0) return null
-      const currentIndex = this.currentItemId
-        ? this.playlist.findIndex(item => item.id === this.currentItemId)
-        : -1
-      if (currentIndex < 0) return this.playlist[0].id
-
-      switch (this.playMode) {
-        case 'sequential':
-          return currentIndex >= this.playlist.length - 1
-            ? null
-            : this.playlist[currentIndex + 1].id
-        case 'random': {
-          if (this.playlist.length === 1) return this.playlist[0].id
-          let nextIndex: number
-          do {
-            nextIndex = Math.floor(Math.random() * this.playlist.length)
-          } while (nextIndex === currentIndex)
-          return this.playlist[nextIndex].id
-        }
-        case 'repeat_one':
-          return this.playlist[currentIndex].id
-        case 'repeat_all':
-          return this.playlist[(currentIndex + 1) % this.playlist.length].id
-      }
-    },
-    getPrevItemId(): string | null {
-      if (this.playlist.length === 0) return null
-      const currentIndex = this.currentItemId
-        ? this.playlist.findIndex(item => item.id === this.currentItemId)
-        : -1
-      if (currentIndex < 0) return this.playlist[this.playlist.length - 1].id
-
-      switch (this.playMode) {
-        case 'sequential':
-          return currentIndex <= 0 ? null : this.playlist[currentIndex - 1].id
-        case 'random': {
-          if (this.playlist.length === 1) return this.playlist[0].id
-          let previousIndex: number
-          do {
-            previousIndex = Math.floor(Math.random() * this.playlist.length)
-          } while (previousIndex === currentIndex)
-          return this.playlist[previousIndex].id
-        }
-        case 'repeat_one':
-          return this.playlist[currentIndex].id
-        case 'repeat_all':
-          return this.playlist[
-            currentIndex === 0 ? this.playlist.length - 1 : currentIndex - 1
-          ].id
-      }
-    },
+    async setPlayMode(mode: PlayMode) { return useSettingsStore().update({ play_mode: mode }) },
   },
 })

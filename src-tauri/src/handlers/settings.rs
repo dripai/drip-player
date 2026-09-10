@@ -1,5 +1,6 @@
-use crate::services::persistence::{AppSettings, AppSettingsPatch};
-use crate::AppState;
+use crate::app_state::{lock, AppState};
+use crate::models::settings::{AppSettings, AppSettingsPatch};
+use crate::services::directory_library::{self, DirectoryUpdate};
 use tauri::{
     menu::{CheckMenuItem, ContextMenu, Menu, MenuItem},
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, Window,
@@ -40,6 +41,7 @@ pub async fn show_app_context_menu(window: Window, locale: String) -> Result<(),
 }
 
 // Window creation runs off the main thread as required by WebView2.
+#[tauri::command]
 pub async fn open_settings_window(app: AppHandle, locale: String) -> Result<(), String> {
     let state = app.state::<SettingsWindowState>();
     let _opening = state.0.lock().await;
@@ -53,14 +55,14 @@ pub async fn open_settings_window(app: AppHandle, locale: String) -> Result<(), 
         .get_webview_window("main")
         .ok_or_else(|| "Main window is unavailable".to_string())?;
     let title = if locale == "zh" {
-        "设置 · Drip Player"
+        "设置 · 影子播放器"
     } else {
-        "Settings · Drip Player"
+        "Settings · Shadow Player"
     };
     WebviewWindowBuilder::new(&app, "settings", WebviewUrl::App("index.html".into()))
         .title(title)
-        .inner_size(620.0, 460.0)
-        .min_inner_size(520.0, 380.0)
+        .inner_size(800.0, 620.0)
+        .min_inner_size(660.0, 480.0)
         .center()
         .resizable(true)
         .maximizable(false)
@@ -75,8 +77,7 @@ pub async fn open_settings_window(app: AppHandle, locale: String) -> Result<(), 
 
 #[tauri::command]
 pub fn get_app_settings(state: State<AppState>) -> Result<AppSettings, String> {
-    let player = state.0.lock().map_err(|error| error.to_string())?;
-    Ok(player.settings.clone())
+    Ok(lock(&state.settings)?.clone())
 }
 
 pub fn apply_close_behavior(app: &AppHandle, enabled: bool) -> Result<AppSettings, String> {
@@ -91,49 +92,36 @@ pub fn apply_close_behavior(app: &AppHandle, enabled: bool) -> Result<AppSetting
 
 fn apply_settings(app: &AppHandle, patch: AppSettingsPatch) -> Result<AppSettings, String> {
     let state = app.state::<AppState>();
-    let mut player = state.0.lock().map_err(|error| error.to_string())?;
-    let previous = player.settings.minimize_to_tray;
-    let mut settings = player.settings.clone();
-    if let Some(theme) = patch.theme {
-        if !matches!(theme.as_str(), "auto" | "light" | "dark") {
-            return Err("Invalid theme".to_string());
+    let mut current = lock(&state.settings)?;
+    let settings = current.patched(patch)?;
+    lock(&state.database)?.save_settings(&settings)?;
+    *current = settings.clone();
+    drop(current);
+    // Native menu methods dispatch to the main thread. Never wait for them while
+    // holding settings/database locks; a window-close callback reads settings too.
+    let sync_app = app.clone();
+    app.run_on_main_thread(move || {
+        let result = (|| {
+            // Read the latest committed value when this callback runs, so queued
+            // callbacks from older writes cannot restore an obsolete tray value.
+            let state = sync_app.state::<AppState>();
+            let enabled = lock(&state.settings)?.minimize_to_tray;
+            sync_app
+                .state::<TraySettingsItem>()
+                .0
+                .set_checked(enabled)
+                .map_err(|error| error.to_string())
+        })();
+        if let Err(error) = result {
+            let _ = sync_app.emit(
+                "app-error",
+                format!("Settings saved, but tray synchronization failed: {error}"),
+            );
         }
-        settings.theme = theme;
-    }
-    if let Some(language) = patch.language {
-        if !matches!(language.as_str(), "zh" | "en") {
-            return Err("Invalid interface language".to_string());
-        }
-        settings.language = language;
-    }
-    if let Some(play_mode) = patch.play_mode {
-        if !matches!(
-            play_mode.as_str(),
-            "sequential" | "random" | "repeat_one" | "repeat_all"
-        ) {
-            return Err("Invalid play mode".to_string());
-        }
-        settings.play_mode = play_mode;
-    }
-    if let Some(enabled) = patch.minimize_to_tray {
-        settings.minimize_to_tray = enabled;
-    }
-    settings.revision = settings
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| "Settings revision overflow".to_string())?;
-    let tray = app.state::<TraySettingsItem>();
-    tray.0
-        .set_checked(settings.minimize_to_tray)
-        .map_err(|error| error.to_string())?;
-    if let Err(error) = player.persistence.save_settings(&settings) {
-        tray.0.set_checked(previous).map_err(|rollback_error| {
-            format!("{error}; failed to restore tray state: {rollback_error}")
-        })?;
-        return Err(error);
-    }
-    player.settings = settings.clone();
-    drop(player);
+    })
+    .map_err(|error| {
+        format!("Settings saved, but tray synchronization could not be scheduled: {error}")
+    })?;
     app.emit("settings-changed", &settings)
         .map_err(|error| format!("Settings saved, but failed to notify windows: {error}"))?;
     Ok(settings)
@@ -142,4 +130,41 @@ fn apply_settings(app: &AppHandle, patch: AppSettingsPatch) -> Result<AppSetting
 #[tauri::command]
 pub fn update_app_settings(app: AppHandle, patch: AppSettingsPatch) -> Result<AppSettings, String> {
     apply_settings(&app, patch)
+}
+
+pub fn notify_directory_update(
+    app: &AppHandle,
+    update: DirectoryUpdate,
+) -> Result<AppSettings, String> {
+    let mut errors: Vec<String> = update.playback_error.into_iter().collect();
+    for result in [
+        app.emit("settings-changed", &update.settings),
+        app.emit("playlist-updated", ()),
+        app.emit("downloads-updated", ()),
+        app.emit("player-state-changed", ()),
+    ] {
+        if let Err(error) = result {
+            errors.push(format!("目录和播放列表已更新，但窗口通知失败：{error}"));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("；"));
+    }
+    Ok(update.settings)
+}
+
+#[tauri::command]
+pub async fn set_download_directory(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<AppSettings, String> {
+    let state = state.inner().clone();
+    let update = tauri::async_runtime::spawn_blocking(move || {
+        directory_library::update_directory(&state, Some(path.into()))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    crate::services::downloads::notify(&app);
+    notify_directory_update(&app, update?)
 }

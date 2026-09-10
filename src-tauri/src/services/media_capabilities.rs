@@ -1,4 +1,4 @@
-use crate::models::playlist::MediaType;
+use crate::models::media::MediaType;
 use std::path::Path;
 
 pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"];
@@ -7,12 +7,13 @@ pub const EXTERNAL_VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "avi", "mov", "flv", "wmv", "ts", "m2ts", "mpg", "mpeg", "3gp",
 ];
 pub const MEDIA_EXTENSIONS: &[&str] = &[
-    "mp3", "wav", "ogg", "flac", "m4a", "aac", "opus", "mp4", "m4v", "webm", "mkv",
-    "avi", "mov", "flv", "wmv", "ts", "m2ts", "mpg", "mpeg", "3gp",
+    "mp3", "wav", "ogg", "flac", "m4a", "aac", "opus", "mp4", "m4v", "webm", "mkv", "avi", "mov",
+    "flv", "wmv", "ts", "m2ts", "mpg", "mpeg", "3gp",
 ];
 
 pub fn extension_lower(path: &Path) -> Option<String> {
-    path.extension().map(|ext| ext.to_string_lossy().to_lowercase())
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
 }
 
 pub fn is_audio_path(path: &Path) -> bool {

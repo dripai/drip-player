@@ -1,16 +1,21 @@
-use warp::Filter;
-use std::net::SocketAddr;
+use super::online_resolver::VideoPlatform;
 use reqwest::Client;
 use std::convert::Infallible;
-use warp::http::{HeaderMap, Response, StatusCode};
-use futures::stream::StreamExt;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use super::online_resolver::VideoPlatform;
+use warp::http::{HeaderMap, StatusCode};
+use warp::{Filter, Reply};
 
 pub async fn start_server(port: u16) {
-    let client = Client::new();
-    let client = Arc::new(client);
+    let routes = proxy_routes(Arc::new(Client::new()));
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    println!("Starting video proxy server on http://{}", addr);
+    warp::serve(routes).run(addr).await;
+}
 
+fn proxy_routes(
+    client: Arc<Client>,
+) -> impl Filter<Extract = (impl Reply,), Error = warp::Rejection> + Clone {
     let client_filter = warp::any().map(move || client.clone());
 
     // Video proxy route (for bilibili, douyin, tencent etc)
@@ -25,12 +30,78 @@ pub async fn start_server(port: u16) {
         .allow_headers(vec!["Range", "Content-Type", "User-Agent"])
         .allow_methods(vec!["GET", "HEAD", "OPTIONS"]);
 
-    let routes = proxy_route.with(cors);
+    proxy_route.with(cors).boxed()
+}
 
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    println!("Starting video proxy server on http://{}", addr);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
 
-    warp::serve(routes).run(addr).await;
+    #[tokio::test]
+    async fn forwards_range_and_preserves_binary_partial_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0 && request.len() < 8192);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .to_lowercase()
+                .contains("range: bytes=1-3"));
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: 3\r\nContent-Range: bytes 1-3/5\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.write_all(&[0, 127, 255]).await.unwrap();
+        });
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("url", &format!("http://{addr}/video"))
+            .finish();
+        let routes = proxy_routes(Arc::new(Client::builder().no_proxy().build().unwrap()));
+        let response = timeout(
+            Duration::from_secs(5),
+            warp::test::request()
+                .path(&format!("/video_proxy?{query}"))
+                .header("Range", "bytes=1-3")
+                .reply(&routes),
+        )
+        .await
+        .unwrap();
+        upstream.await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()["content-range"], "bytes 1-3/5");
+        assert_eq!(response.headers()["accept-ranges"], "bytes");
+        assert_eq!(response.headers()["content-type"], "video/mp4");
+        assert_eq!(response.body().as_ref(), &[0, 127, 255]);
+    }
+
+    #[tokio::test]
+    async fn upstream_disconnect_returns_an_error_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+        let routes = proxy_routes(Arc::new(Client::builder().no_proxy().build().unwrap()));
+        let response = timeout(
+            Duration::from_secs(5),
+            warp::test::request()
+                .path(&format!("/video_proxy?url=http://{addr}/video"))
+                .reply(&routes),
+        )
+        .await
+        .unwrap();
+        upstream.await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.body().as_ref(), b"Internal Server Error");
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -68,33 +139,32 @@ async fn handle_proxy(
             let status = resp.status();
             let headers = resp.headers().clone();
 
-            // Create response builder
-            let mut response_builder = Response::builder().status(status.as_u16());
+            let mut response = warp::reply::stream(resp.bytes_stream()).into_response();
+            *response.status_mut() = status;
 
             // Forward headers
             for (key, value) in headers.iter() {
                 // Forward relevant headers
-                if key == "content-length" || key == "content-type" || key == "content-range" || key == "accept-ranges" {
-                    if let Ok(v) = value.to_str() {
-                        response_builder = response_builder.header(key.as_str(), v);
-                    }
+                if key == "content-length"
+                    || key == "content-type"
+                    || key == "content-range"
+                    || key == "accept-ranges"
+                {
+                    response.headers_mut().insert(key.clone(), value.clone());
                 }
             }
 
-            // Stream body
-            let stream = resp.bytes_stream().map(|result| {
-                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            });
-            let body = warp::hyper::Body::wrap_stream(stream);
-
-            Ok(response_builder.body(body).unwrap())
-        },
+            Ok(response)
+        }
         Err(e) => {
             println!("Proxy request failed: {}", e);
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(warp::hyper::Body::from("Internal Server Error"))
-                .unwrap())
+            Ok(
+                warp::reply::with_status(
+                    "Internal Server Error",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+                .into_response(),
+            )
         }
     }
 }

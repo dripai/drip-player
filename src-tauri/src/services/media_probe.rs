@@ -1,4 +1,4 @@
-use crate::models::playlist::MediaType;
+use crate::models::media::MediaType;
 use crate::services::media_capabilities;
 use crate::services::toolchain;
 use serde::{Deserialize, Serialize};
@@ -134,7 +134,7 @@ fn is_mp4_family_container(container: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{can_remux_to_browser_mp4, MediaInfo};
-    use crate::models::playlist::MediaType;
+    use crate::models::media::MediaType;
 
     #[test]
     fn h264_with_opus_can_be_remuxed_for_browser_playback() {

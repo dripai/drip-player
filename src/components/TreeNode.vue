@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Music, Video, FolderOpen as FolderIcon, ChevronRight, ChevronDown } from 'lucide-vue-next'
+import { Music, Video, FolderOpen as FolderIcon, ChevronRight, ChevronDown } from '@lucide/vue'
 import { computed } from 'vue'
 import { isSourceLocal, isSourceRemote, type LibraryItem, type ResolvedTrack } from '../store/player'
 import { trackHasVideo } from '../utils/mediaCapabilities'
@@ -75,7 +75,7 @@ function onPlayTrack() {
     <div v-if="isFolder && folder">
       <div
         @click="emit('toggle-folder', folder.path)"
-        class="flex items-center px-2 py-1 rounded cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors select-none"
+        class="flex items-center px-2 py-1 rounded-sm cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors select-none"
         :style="{ paddingLeft: (level * 12 + 8) + 'px' }"
       >
         <ChevronDown v-if="expandedFolders.has(folder.path)" class="w-3 h-3 mr-1 text-zinc-400" />
@@ -102,7 +102,7 @@ function onPlayTrack() {
     <div v-else-if="isTrack && track">
       <div
         @dblclick="onPlayTrack"
-        class="flex items-center px-2 py-1 rounded transition-colors select-none"
+        class="flex items-center px-2 py-1 rounded-sm transition-colors select-none"
         :class="{
             'bg-zinc-200 dark:bg-zinc-800 text-blue-600 dark:text-blue-400': isCurrentTrack(track),
             'cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800': !isCurrentTrack(track)

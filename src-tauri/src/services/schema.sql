@@ -8,7 +8,6 @@ CREATE TABLE media (
     remote_url TEXT,
     provider TEXT,
     external_id TEXT,
-    cached_path TEXT,
     CHECK (
         (origin_kind = 'local' AND local_path IS NOT NULL
             AND remote_url IS NULL AND provider IS NULL AND external_id IS NULL)
@@ -17,6 +16,18 @@ CREATE TABLE media (
             AND remote_url IS NOT NULL AND provider IS NOT NULL AND external_id IS NOT NULL)
     )
 ) STRICT;
+
+CREATE TABLE media_assets (
+    id TEXT PRIMARY KEY NOT NULL,
+    media_id TEXT NOT NULL REFERENCES media(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN ('playback', 'subtitle')),
+    path TEXT NOT NULL CHECK (length(trim(path)) > 0),
+    language TEXT,
+    source TEXT NOT NULL CHECK (source IN ('local', 'download')),
+    UNIQUE (media_id, path),
+    CHECK ((kind = 'playback' AND language IS NULL) OR kind = 'subtitle')
+) STRICT;
+CREATE UNIQUE INDEX one_playback_asset_per_media ON media_assets(media_id) WHERE kind = 'playback';
 
 -- Membership can be removed without deleting the underlying media identity.
 CREATE TABLE playlist_entries (
@@ -43,4 +54,4 @@ CREATE TABLE app_settings (
 INSERT INTO app_settings (id, revision, theme, language, play_mode, minimize_to_tray)
 VALUES (1, 0, 'auto', 'zh', 'sequential', 0);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

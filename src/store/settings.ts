@@ -14,14 +14,16 @@ export interface AppSettings {
   language: Language
   play_mode: PlayMode
   minimize_to_tray: boolean
+  download_directory: string
 }
 
-export type SettingsPatch = Partial<Omit<AppSettings, 'revision'>>
+export type SettingsPatch = Partial<Omit<AppSettings, 'revision' | 'download_directory'>>
 
 export const useSettingsStore = defineStore('settings', () => {
   // Bootstrap display values only; controls mount after SQLite has been read.
   const data = ref<AppSettings>({
     revision: -1, theme: 'auto', language: 'zh', play_mode: 'sequential', minimize_to_tray: false,
+    download_directory: '',
   })
   const ready = ref(false)
   const saving = ref(false)
@@ -53,12 +55,12 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  async function update(patch: SettingsPatch) {
+  async function persist(command: string, args: Record<string, unknown>) {
     if (!ready.value || saving.value) return false
     saving.value = true
     error.value = ''
     try {
-      accept(await invoke<AppSettings>('update_app_settings', { patch }))
+      accept(await invoke<AppSettings>(command, args))
       return true
     } catch (cause) {
       error.value = String(cause)
@@ -68,10 +70,13 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
+  function update(patch: SettingsPatch) { return persist('update_app_settings', { patch }) }
+  function setDownloadDirectory(path: string) { return persist('set_download_directory', { path }) }
+
   function dispose() {
     disposed = true
     unlisten?.()
   }
 
-  return { data, ready, saving, error, isDark, initialize, update, dispose }
+  return { data, ready, saving, error, isDark, initialize, update, setDownloadDirectory, dispose }
 })

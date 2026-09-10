@@ -1,7 +1,7 @@
 {
-  "productName": "drip-player",
+  "productName": "Shadow Player",
   "version": "1.0.4",
-  "identifier": "com.drip.player",
+  "identifier": "com.shadow.player",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "pnpm build:tauri",
@@ -13,7 +13,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "Drip Player",
+        "title": "Shadow Player",
         "width": 1000,
         "height": 700,
         "decorations": false,
@@ -29,6 +29,7 @@
     }
   },
   "bundle": {
+    "macOS": { "entitlements": "Entitlements.plist" },
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
@@ -36,6 +37,10 @@
       "../lib": "lib"
     },
     "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
       "icons/icon.ico",
       "icons/icon.png"
     ]

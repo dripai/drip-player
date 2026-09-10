@@ -1,16 +1,19 @@
 <script setup lang="ts">
-import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
+import { computed, ref, shallowRef, onUnmounted, watch } from 'vue'
+import type videojs from 'video.js'
 import { usePlayerStore, type PlayMode, isSourceLocal, isSourceRemote } from '../store/player'
-import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Music, Maximize, Gauge, Repeat, Repeat1, Shuffle, ListOrdered, Subtitles, MonitorPlay } from 'lucide-vue-next'
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Music, Maximize, Gauge, Repeat, Repeat1, Shuffle, ListOrdered, Subtitles, MonitorPlay } from '@lucide/vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import BrowserPlayback from './BrowserPlayback.vue'
 import { useI18n } from 'vue-i18n'
-import { getTrackFilePath, trackHasVideo } from '../utils/mediaCapabilities'
+import { trackHasVideo } from '../utils/mediaCapabilities'
+import { useLearningStore } from '../store/learning'
 
 const { t } = useI18n()
 const store = usePlayerStore()
-const resolvedVideoUrl = ref('')
-const videoPlayer = ref<any>(null) // Actual video.js player instance
+const learning = useLearningStore()
+const learningCue = computed(() => learning.transcript?.cues[learning.active] || null)
+const videoPlayer = shallowRef<ReturnType<typeof videojs> | null>(null)
 const volume = ref(100)
 const isMuted = ref(false)
 const showVolumeSlider = ref(false)
@@ -21,17 +24,7 @@ const showPlayModeMenu = ref(false)
 const showSubtitleMenu = ref(false)
 const availableSubtitles = ref<{lang: string, path: string}[]>([])
 const currentSubtitle = ref<string | null>(null)
-const plannedBrowserVideoPath = ref<string | null>(null)
-const plannedExternalVideoPath = ref<string | null>(null)
-const plannedEngine = ref<PlaybackPlan['engine'] | null>(null)
-const isPlanningBrowserVideo = ref(false)
-
-type PlaybackPlan =
-    | { engine: 'browser_video', path?: string | null, remote_url?: string | null }
-    | { engine: 'external_video', path: string }
-    | { engine: 'audio', path: string }
-    | { engine: 'remote_pending', url: string }
-
+const isPlanningBrowserVideo = computed(() => store.session?.status === 'preparing')
 // Progress bar dragging state
 const isDragging = ref(false)
 const dragProgress = ref(0)
@@ -51,32 +44,9 @@ const currentTitle = computed(() => {
 })
 
 const isVideo = computed(() => trackHasVideo(store.currentTrack))
-const usesBrowserPlayer = computed(() => Boolean(resolvedVideoUrl.value || plannedEngine.value === 'browser_video'))
-const usesExternalPlayer = computed(() => plannedEngine.value === 'external_video')
-const currentTrackKey = computed(() => {
-    const track = store.currentTrack
-    if (!track) return ''
-    return getTrackFilePath(track) || track.id
-})
-
-const videoSrc = computed(() => {
-    if (resolvedVideoUrl.value) return resolvedVideoUrl.value;
-    if (plannedBrowserVideoPath.value) return convertFileSrc(plannedBrowserVideoPath.value);
-
-    const t = store.currentTrack;
-    if (!t) return '';
-    if (isSourceLocal(t.source)) {
-        return convertFileSrc(t.source.Local.path);
-    }
-    if (isSourceRemote(t.source)) {
-        if (t.source.Remote.cached_path) {
-            return convertFileSrc(t.source.Remote.cached_path);
-        }
-        return '';
-    }
-    return '';
-})
-
+const usesBrowserPlayer = computed(() => store.session?.plan?.engine === 'browser_video')
+const usesExternalPlayer = computed(() => store.session?.plan?.engine === 'external_video')
+const canControl = computed(() => !learning.recording && !learning.recordingStarting && !learning.savingRecording && Boolean(store.session?.plan) && !usesExternalPlayer.value && !['preparing', 'failed', 'stopped'].includes(store.session?.status || ''))
 // Display progress (use drag progress when dragging)
 const displayProgress = computed(() => {
     return isDragging.value ? dragProgress.value : store.progress * 100
@@ -93,82 +63,24 @@ const playModeIcon = computed(() => {
     }
 })
 
-// Get video file path for subtitle scanning
-const currentVideoPath = computed(() => {
-    const t = store.currentTrack
-    if (!t) return null
-    if (isSourceLocal(t.source)) return t.source.Local.path
-    if (isSourceRemote(t.source) && t.source.Remote.cached_path) return t.source.Remote.cached_path
-    return null
+watch(() => store.session?.id, () => {
+    videoPlayer.value = null
+    availableSubtitles.value = []
+    currentSubtitle.value = null
+    isDragging.value = false
 })
 
-// Scan for available subtitles when track changes
-watch(currentTrackKey, async () => {
-    const newTrack = store.currentTrack
-    resolvedVideoUrl.value = '';
-    plannedBrowserVideoPath.value = null;
-    plannedExternalVideoPath.value = null;
-    plannedEngine.value = null;
-    isPlanningBrowserVideo.value = false;
-    availableSubtitles.value = [];
-    currentSubtitle.value = null;
-    videoPlayer.value = null;
-
-    if (newTrack) {
-        // Scan for subtitles
-        await scanSubtitles();
-    }
-
-    if (newTrack && trackHasVideo(newTrack)) {
-        isPlanningBrowserVideo.value = true
-        try {
-            const plan = await invoke<PlaybackPlan>('get_playback_plan', { item: { Track: newTrack } })
-            plannedEngine.value = plan.engine
-            if (plan.engine === 'browser_video') {
-                plannedBrowserVideoPath.value = plan.path || getTrackFilePath(newTrack)
-            } else if (plan.engine === 'external_video' && plan.path) {
-                plannedExternalVideoPath.value = plan.path
-            }
-        } catch (e) {
-            console.error('Failed to get playback plan:', e)
-        } finally {
-            isPlanningBrowserVideo.value = false
-        }
-    }
-
-    // Resolve online video URL if not cached
-    if (newTrack && isSourceRemote(newTrack.source)) {
-        // If already cached, don't need to resolve URL
-        if (newTrack.source.Remote.cached_path) {
-            console.log('Using cached file:', newTrack.source.Remote.cached_path);
-            return;
-        }
-
-        const url = newTrack.source.Remote.url;
-        // Check if it's an online video URL (supports bilibili, youtube, douyin, tencent, etc.)
-        if (url.startsWith('http://') || url.startsWith('https://')) {
-            try {
-                await invoke('play_online_video', { url });
-            } catch (e) {
-                console.error('Failed to request online video:', e);
-            }
-        }
-    }
-}, { immediate: true })
-
-async function scanSubtitles() {
-    const videoPath = currentVideoPath.value
-    if (!videoPath) return
-
+watch([() => store.session?.id, () => store.session?.plan?.path], async ([sessionId, path], _, onCleanup) => {
+    let cancelled = false
+    onCleanup(() => { cancelled = true })
+    const mediaId = store.session?.media.id
+    if (!mediaId || !path || !usesBrowserPlayer.value) return
     try {
-        const subtitles = await invoke<{lang: string, path: string}[]>('scan_subtitles', { videoPath })
-        availableSubtitles.value = subtitles
-        console.log('Found subtitles:', subtitles)
-    } catch (e) {
-        console.error('Failed to scan subtitles:', e)
-        availableSubtitles.value = []
-    }
-}
+        const assets = await invoke<import('../store/player').MediaAsset[]>('get_media_subtitles', { mediaId })
+        if (cancelled || store.session?.id !== sessionId) return
+        availableSubtitles.value = assets.map(asset => ({ lang: asset.language || 'und', path: asset.path }))
+    } catch (error) { if (!cancelled) store.error = String(error) }
+}, { immediate: true })
 
 function selectSubtitle(subtitle: {lang: string, path: string} | null) {
     showSubtitleMenu.value = false
@@ -176,7 +88,8 @@ function selectSubtitle(subtitle: {lang: string, path: string} | null) {
         currentSubtitle.value = null
         if (videoPlayer.value) {
             // Remove all text tracks
-            const tracks = videoPlayer.value.textTracks()
+            // Video.js exposes array-like tracks; its generated declarations omit the indexer.
+            const tracks = videoPlayer.value.textTracks() as unknown as ArrayLike<{ mode: TextTrackMode }>
             for (let i = 0; i < tracks.length; i++) {
                 tracks[i].mode = 'disabled'
             }
@@ -190,30 +103,26 @@ function selectSubtitle(subtitle: {lang: string, path: string} | null) {
         const subtitleUrl = convertFileSrc(subtitle.path)
 
         // Remove existing tracks first
-        const existingTracks = videoPlayer.value.textTracks()
+        const existingTracks = videoPlayer.value.textTracks() as unknown as ArrayLike<{ mode: TextTrackMode }>
         for (let i = existingTracks.length - 1; i >= 0; i--) {
             existingTracks[i].mode = 'disabled'
         }
 
         // Add new track
-        videoPlayer.value.addRemoteTextTrack({
-            kind: 'subtitles',
-            label: subtitle.lang,
-            src: subtitleUrl,
-            default: true
+        const remoteTrack = videoPlayer.value.addRemoteTextTrack({
+            kind: 'subtitles', label: subtitle.lang, src: subtitleUrl, default: true
         }, false)
+        // The runtime HTMLTrackElement.track getter is also absent from its declarations.
+        const trackElement = remoteTrack as unknown as { track: { mode: TextTrackMode } }
+        trackElement.track.mode = 'showing'
 
-        // Enable the new track
-        setTimeout(() => {
-            const tracks = videoPlayer.value.textTracks()
-            for (let i = 0; i < tracks.length; i++) {
-                if (tracks[i].label === subtitle.lang) {
-                    tracks[i].mode = 'showing'
-                }
-            }
-        }, 100)
     }
 }
+
+watch(() => learning.enabled, enabled => {
+    if (enabled) selectSubtitle(null)
+    else { playbackRate.value = 1; videoPlayer.value?.playbackRate(1) }
+})
 
 function cyclePlayMode() {
     const modes: PlayMode[] = ['sequential', 'random', 'repeat_one', 'repeat_all']
@@ -293,43 +202,25 @@ watch(isVideo, (video) => {
     }
 })
 
-onMounted(async () => {
-    await listen('online_video_url', (event: any) => {
-        console.log('Received online video URL:', event.payload);
-        const originalUrl = event.payload as string;
-        resolvedVideoUrl.value = `http://localhost:10001/video_proxy?url=${encodeURIComponent(originalUrl)}`;
-    });
-})
-
 onUnmounted(() => {
-    if (controlsHideTimer.value) {
-        clearTimeout(controlsHideTimer.value)
-    }
+    if (controlsHideTimer.value) clearTimeout(controlsHideTimer.value)
 })
 
-function onPlayerReady({ player }: { player: any }) {
-    console.log('Video player ready:', player);
-    videoPlayer.value = player;
-    // Apply current volume and playback rate
-    player.volume(volume.value / 100);
-    player.playbackRate(playbackRate.value);
-
-    // Listen for video ended event
-    player.on('ended', () => {
-        console.log('Video ended, play mode:', store.playMode);
-        onTrackEnded();
-    });
+function onPlayerReady(player: ReturnType<typeof videojs>, sessionId: number) {
+    if (store.session?.id !== sessionId) return
+    videoPlayer.value = player
+    player.volume(volume.value / 100)
+    player.muted(isMuted.value)
+    player.playbackRate(playbackRate.value)
+    learning.attach(player, sessionId)
 }
 
-function onTrackEnded() {
-    const nextItemId = store.getNextItemId();
-    if (nextItemId !== null) {
-        store.play(nextItemId);
-    } else {
-        // No next track, stop playing
-        store.isPlaying = false;
+watch(() => store.session?.plan?.engine, (engine) => {
+    if (engine === 'audio' && store.session) {
+        void invoke('set_volume', { sessionId: store.session.id, volume: isMuted.value ? 0 : volume.value / 100 })
+            .catch(error => { store.error = String(error) })
     }
-}
+})
 
 function formatTime(sec: number) {
     if (!sec || isNaN(sec)) return '0:00'
@@ -339,6 +230,7 @@ function formatTime(sec: number) {
 }
 
 function onSeekStart() {
+    learning.stopLoop(); learning.stopPreview()
     isDragging.value = true
     dragProgress.value = store.progress * 100
 }
@@ -365,12 +257,10 @@ function onSeekEnd(e: Event) {
 
     if (usesBrowserPlayer.value && videoPlayer.value) {
         const player = videoPlayer.value
-        const duration = player.duration()
+        const duration = player.duration() ?? 0
         const seekTime = duration * (val / 100)
         console.log('Video seek to:', seekTime, 'seconds (duration:', duration, ')')
         player.currentTime(seekTime)
-        // Also update backend state for video
-        store.seek(progress).catch(err => console.error('Backend seek update failed:', err))
     } else {
         console.log('Audio seek to progress:', progress)
         store.seek(progress)
@@ -382,65 +272,48 @@ function onSeekEnd(e: Event) {
     }
 }
 
-function togglePlayPause() {
-    console.log('togglePlayPause called', { isVideo: isVideo.value, currentTrack: store.currentTrack })
-
-    if (usesBrowserPlayer.value && videoPlayer.value) {
-        const player = videoPlayer.value
-        if (player.paused()) {
-            player.play()
-            store.isPlaying = true
-        } else {
-            player.pause()
-            store.isPlaying = false
-        }
-    } else {
-        if (store.isPlaying) {
-            console.log('Calling pause')
-            store.pause()
-        } else {
-            console.log('Calling resume')
-            store.resume()
-        }
-    }
+async function togglePlayPause() {
+    if (!canControl.value) return
+    learning.stopLoop(); learning.stopPreview()
+    try {
+        if (store.session?.status === 'ended') { await store.replay(); return }
+        if (usesBrowserPlayer.value && videoPlayer.value) {
+            if (videoPlayer.value.paused()) await videoPlayer.value.play()
+            else videoPlayer.value.pause()
+        } else if (store.isPlaying) await store.pause()
+        else await store.resume()
+    } catch (error) { store.error = String(error) }
 }
 
-function playNext() {
-    const nextItemId = store.getNextItemId()
-    if (nextItemId !== null) {
-        store.play(nextItemId)
-    }
-}
-
-function playPrevious() {
-    const previousItemId = store.getPrevItemId()
-    if (previousItemId !== null) {
-        store.play(previousItemId)
-    }
-}
+function playNext() { void store.advance(false).catch(error => { store.error = String(error) }) }
+function playPrevious() { void store.advance(true).catch(error => { store.error = String(error) }) }
 
 function onVolumeChange(e: Event) {
+    if (!canControl.value) return
     const target = e.target as HTMLInputElement
     const val = parseInt(target.value)
     volume.value = val
     console.log('Volume change:', val, 'normalized:', val / 100)
 
+    isMuted.value = false
     // 当音量为0时，确保完全静音
     const normalizedVolume = val === 0 ? 0 : val / 100
 
     if (usesBrowserPlayer.value && videoPlayer.value) {
+        videoPlayer.value.muted(false)
         videoPlayer.value.volume(normalizedVolume)
         console.log('Video volume set to:', normalizedVolume)
     } else {
         // Audio volume control via backend
         console.log('Calling set_volume:', normalizedVolume)
-        invoke('set_volume', { volume: normalizedVolume })
+        invoke('set_volume', { sessionId: store.session?.id, volume: normalizedVolume })
             .then(() => console.log('Volume set successfully'))
             .catch(err => console.error('Failed to set volume:', err))
     }
 }
 
 function toggleMute() {
+    if (!canControl.value) return
     isMuted.value = !isMuted.value
     console.log('Toggle mute:', isMuted.value)
 
@@ -450,14 +323,16 @@ function toggleMute() {
         // Audio mute via volume
         const vol = isMuted.value ? 0 : volume.value / 100
         console.log('Setting volume for mute:', vol)
-        invoke('set_volume', { volume: vol })
+        invoke('set_volume', { sessionId: store.session?.id, volume: vol })
             .then(() => console.log('Mute toggled successfully'))
             .catch(err => console.error('Failed to toggle mute:', err))
     }
 }
 
 function setPlaybackRate(rate: number) {
+    if (!usesBrowserPlayer.value) return
     playbackRate.value = rate
+    if (learning.enabled) learning.rate = rate
     showSpeedMenu.value = false
 
     if (usesBrowserPlayer.value && videoPlayer.value) {
@@ -476,10 +351,6 @@ function toggleFullscreen() {
     }
 }
 
-function onVideoError(e: any) {
-    console.error('Video player error:', e);
-    store.reportPlaybackError();
-}
 </script>
 
 <template>
@@ -491,16 +362,8 @@ function onVideoError(e: any) {
     <!-- Main Content (Art / Viz / Video) -->
     <div class="flex-1 flex items-center justify-center p-0 text-zinc-300 dark:text-zinc-700 select-none overflow-hidden relative">
 
-        <div v-if="usesBrowserPlayer && !isPlanningBrowserVideo && videoSrc" class="w-full h-full flex items-center justify-center bg-black">
-            <VideoPlayer
-                class="w-full h-full"
-                :src="videoSrc"
-                :controls="false"
-                :fluid="true"
-                :autoplay="true"
-                @mounted="onPlayerReady"
-                @error="onVideoError"
-            />
+        <div v-if="usesBrowserPlayer && store.session" class="w-full h-full flex items-center justify-center bg-black">
+            <BrowserPlayback :key="store.session.id" :session="store.session" @ready="onPlayerReady" />
         </div>
 
         <div v-else-if="isVideo && isPlanningBrowserVideo" class="w-full h-full flex items-center justify-center bg-black text-zinc-300">
@@ -511,16 +374,22 @@ function onVideoError(e: any) {
             <MonitorPlay class="w-24 h-24 opacity-60" />
             <div class="text-center px-6">
                 <h2 class="text-xl font-semibold text-white mb-2 truncate max-w-[80vw]">{{ currentTitle }}</h2>
-                <p class="text-sm text-zinc-400">Playing with MPV</p>
+                <p class="text-sm text-zinc-400">{{ t(store.session?.status === 'external' ? 'player.externalControls' : 'player.externalStopped') }}</p>
             </div>
         </div>
 
         <div v-else class="text-center w-full max-w-2xl p-8">
-            <div class="aspect-square max-h-[400px] rounded-2xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center mx-auto mb-8 shadow-2xl border dark:border-zinc-700/50">
+            <div class="aspect-square max-h-[400px] rounded-2xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center mx-auto mb-8 shadow-2xl border border-gray-200 dark:border-zinc-700/50">
                 <Music class="w-32 h-32 opacity-20" />
             </div>
             <h2 class="text-2xl font-bold text-zinc-800 dark:text-zinc-200 mb-2 truncate px-4">{{ currentTitle }}</h2>
-            <p class="text-zinc-500 font-medium">Drip Player</p>
+            <p class="text-zinc-500 font-medium">{{ t('app.title') }}</p>
+        </div>
+        <div v-if="learning.enabled && learningCue" class="pointer-events-none absolute left-4 right-4 text-center" :class="isVideo && showControls ? 'bottom-36' : 'bottom-6'">
+          <div class="inline-block max-w-full rounded-lg bg-black/75 px-4 py-2 text-white" :style="{ fontSize: `${learning.settings?.subtitle_font_size || 18}px` }">
+            <p class="whitespace-pre-line">{{ learning.masked ? '•••' : learningCue.text }}</p>
+            <p v-if="!learning.masked && learning.bilingual && learningCue.translation && learningCue.translation_language === learning.settings?.translation_language" class="mt-1 whitespace-pre-line text-sm text-zinc-200">{{ learningCue.translation }}</p>
+          </div>
         </div>
     </div>
 
@@ -528,9 +397,9 @@ function onVideoError(e: any) {
     <transition name="controls-slide">
       <div
         v-show="showControls || !isVideo"
-        class="controls-bar border-t dark:border-zinc-800 px-6 flex flex-col justify-center gap-3"
+        class="controls-bar border-t border-gray-200 dark:border-zinc-800 px-6 flex flex-col justify-center gap-3"
         :class="{
-          'absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/70 to-transparent pt-12 pb-4': isVideo,
+          'absolute bottom-0 left-0 right-0 bg-linear-to-t from-black/90 via-black/70 to-transparent pt-12 pb-4': isVideo,
           'h-24 bg-white dark:bg-zinc-900': !isVideo
         }"
         @mouseenter="showControls = true"
@@ -558,6 +427,7 @@ function onVideoError(e: any) {
                     max="100"
                     :value="displayProgress"
                     @mousedown="onSeekStart"
+                    :disabled="!canControl"
                     @touchstart="onSeekStart"
                     @input="onSeekMove"
                     @change="onSeekEnd"
@@ -581,7 +451,7 @@ function onVideoError(e: any) {
                 <button
                     @click="playPrevious"
                     class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                    :disabled="!store.currentTrack"
+                    :disabled="!store.currentTrack || learning.recording || learning.recordingStarting || learning.savingRecording || !!learning.pendingRecording"
                     title="Previous (Ctrl+Left)"
                 >
                     <SkipBack class="w-5 h-5" />
@@ -590,7 +460,7 @@ function onVideoError(e: any) {
                 <button
                     @click="togglePlayPause"
                     class="w-12 h-12 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-lg transition-all hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-                    :disabled="!store.currentTrack"
+                    :disabled="!canControl"
                     title="Play/Pause (Space)"
                 >
                     <Pause v-if="store.isPlaying" class="w-5 h-5 fill-current" />
@@ -600,7 +470,7 @@ function onVideoError(e: any) {
                 <button
                     @click="playNext"
                     class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                    :disabled="!store.currentTrack"
+                    :disabled="!store.currentTrack || learning.recording || learning.recordingStarting || learning.savingRecording || !!learning.pendingRecording"
                     title="Next (Ctrl+Right)"
                 >
                     <SkipForward class="w-5 h-5" />
@@ -662,7 +532,7 @@ function onVideoError(e: any) {
                 </div>
 
                 <!-- Subtitle selector (video only) -->
-                <div v-if="usesBrowserPlayer" class="relative" @mouseenter="showSubtitleMenu = true" @mouseleave="showSubtitleMenu = false">
+                <div v-if="usesBrowserPlayer && !learning.enabled" class="relative" @mouseenter="showSubtitleMenu = true" @mouseleave="showSubtitleMenu = false">
                     <button
                         class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors"
                         :class="{ 'text-blue-600 dark:text-blue-400': currentSubtitle }"
@@ -703,14 +573,15 @@ function onVideoError(e: any) {
                 </div>
 
                 <!-- Playback speed -->
-                <div class="relative" @mouseenter="showSpeedMenu = true" @mouseleave="showSpeedMenu = false">
+                <div class="relative" @mouseenter="showSpeedMenu = usesBrowserPlayer" @mouseleave="showSpeedMenu = false">
                     <button
+                        :disabled="!usesBrowserPlayer"
                         class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors text-xs font-medium"
                         title="Playback speed"
                     >
                         <div class="flex items-center gap-1">
                             <Gauge class="w-4 h-4" />
-                            <span>{{ playbackRate }}x</span>
+                            <span>{{ usesBrowserPlayer ? (learning.enabled ? learning.rate : playbackRate) : 1 }}x</span>
                         </div>
                     </button>
 
@@ -744,9 +615,10 @@ function onVideoError(e: any) {
                 </button>
 
                 <!-- Volume control -->
-                <div class="relative" @mouseenter="showVolumeSlider = true" @mouseleave="showVolumeSlider = false">
+                <div class="relative" @mouseenter="showVolumeSlider = canControl" @mouseleave="showVolumeSlider = false">
                     <button
                         @click="toggleMute"
+                        :disabled="!canControl"
                         class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors"
                         :title="isMuted ? 'Unmute' : 'Mute'"
                     >
@@ -765,6 +637,7 @@ function onVideoError(e: any) {
                                 min="0"
                                 max="100"
                                 :value="volume"
+                                :disabled="!canControl"
                                 @input="onVolumeChange"
                                 class="volume-slider"
                                 orient="vertical"

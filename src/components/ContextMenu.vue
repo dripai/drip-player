@@ -41,7 +41,7 @@ onUnmounted(() => {
 <template>
   <div
     ref="menuRef"
-    class="fixed z-50 bg-white dark:bg-zinc-800 border dark:border-zinc-700 rounded-lg shadow-xl py-1 min-w-[180px]"
+    class="fixed z-50 bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded-lg shadow-xl py-1 min-w-[180px]"
     :style="{ left: x + 'px', top: y + 'px' }"
   >
     <button

@@ -1,174 +1,94 @@
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use crate::models::media::{Media, MediaOrigin, MediaType};
+use serde::Serialize;
+use std::path::PathBuf;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum MediaType {
-    Audio,
-    Video,
-}
-
-fn default_media_type() -> MediaType {
-    MediaType::Audio
-}
-
-/// Download status for remote resources
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum DownloadStatus {
-    NotDownloaded,
-    Downloading,
-    Downloaded,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PlaylistOrigin {
-    Local {
-        path: PathBuf,
-    },
-    Remote {
-        url: String,
-        provider: String,
-        external_id: String,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PlaylistItem {
+#[derive(Clone, Debug)]
+pub struct PlaylistEntry {
     pub id: String,
     pub media_id: String,
-    pub canonical_key: String,
-    pub title: String,
-    pub media_type: MediaType,
-    pub origin: PlaylistOrigin,
-    pub cached_path: Option<PathBuf>,
     pub added_at: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PlaylistDownloadStatus {
+pub enum DownloadStatus {
     NotDownloaded,
-    Downloading,
     Downloaded,
 }
 
-#[derive(Clone, Debug, Serialize)]
+// A read model for the list UI; never accepted as a media write command.
+#[derive(Serialize)]
 pub struct PlaylistItemView {
     pub id: String,
     pub media_id: String,
     pub canonical_key: String,
     pub title: String,
     pub media_type: MediaType,
-    pub origin: PlaylistOrigin,
+    pub origin: MediaOrigin,
     pub cached_path: Option<PathBuf>,
-    pub download_status: PlaylistDownloadStatus,
+    pub download_status: DownloadStatus,
     pub added_at: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+impl PlaylistItemView {
+    pub fn new(entry: PlaylistEntry, media: Media) -> Self {
+        let cached_path = media.cached_path().map(PathBuf::from);
+        let status = if media.local_path().is_some_and(|path| path.is_file()) {
+            DownloadStatus::Downloaded
+        } else {
+            DownloadStatus::NotDownloaded
+        };
+        Self {
+            id: entry.id,
+            media_id: media.id,
+            canonical_key: media.canonical_key,
+            title: media.title,
+            media_type: media.media_type,
+            origin: media.origin,
+            cached_path,
+            download_status: status,
+            added_at: entry.added_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct PlaylistSnapshot {
     pub revision: u64,
     pub items: Vec<PlaylistItemView>,
 }
 
-impl PlaylistItem {
-    pub fn to_library_item(&self) -> LibraryItem {
-        let source = match &self.origin {
-            PlaylistOrigin::Local { path } => LibrarySource::Local { path: path.clone() },
-            PlaylistOrigin::Remote {
-                url, external_id, ..
-            } => LibrarySource::Remote {
-                url: url.clone(),
-                id: external_id.clone(),
-                cached_path: self.cached_path.clone(),
-                media_type: self.media_type.clone(),
-                download_status: if self.cached_path.is_some() {
-                    DownloadStatus::Downloaded
-                } else {
-                    DownloadStatus::NotDownloaded
-                },
-            },
-        };
-
-        LibraryItem::Track {
-            id: self.id.clone(),
-            title: self.title.clone(),
-            media_type: self.media_type.clone(),
-            source,
-            parent: match &self.origin {
-                PlaylistOrigin::Local { path } => path.parent().map(Path::to_path_buf),
-                PlaylistOrigin::Remote { .. } => None,
-            },
+pub fn adjacent_entry(
+    entries: &[PlaylistEntry],
+    current: Option<&str>,
+    mode: &str,
+    backwards: bool,
+) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let index = current.and_then(|id| entries.iter().position(|entry| entry.id == id));
+    let next = match index {
+        None => {
+            if backwards {
+                entries.len() - 1
+            } else {
+                0
+            }
         }
-    }
-}
-
-pub fn canonical_local_identity(path: &Path) -> (PathBuf, String) {
-    let normalized_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut normalized = normalized_path.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        normalized = normalized.to_lowercase();
-    }
-    (normalized_path, format!("local:{}", normalized))
-}
-
-pub fn canonical_remote_key(provider: &str, external_id: &str) -> String {
-    format!("remote:{}:{}", provider.to_lowercase(), external_id)
-}
-
-pub fn provider_key_for_url(value: &str) -> String {
-    let lower = value.to_lowercase();
-    if lower.contains("bilibili.com") || lower.contains("b23.tv") {
-        return "bilibili".to_string();
-    }
-    if lower.contains("youtube.com") || lower.contains("youtu.be") {
-        return "youtube".to_string();
-    }
-    if lower.contains("douyin.com") || lower.contains("iesdouyin.com") {
-        return "douyin".to_string();
-    }
-    if lower.contains("v.qq.com") || lower.contains("qq.com/x/cover") {
-        return "tencent".to_string();
-    }
-    if lower.contains("channels.weixin.qq.com") || lower.contains("finder.video.qq.com") {
-        return "weixin".to_string();
-    }
-
-    url::Url::parse(value)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_lowercase))
-        .unwrap_or_else(|| "generic".to_string())
-}
-
-/// Source of a library item
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LibrarySource {
-    Local {
-        path: PathBuf,
-    },
-    Remote {
-        url: String,
-        id: String,
-        cached_path: Option<PathBuf>,
-        #[serde(default = "default_media_type")]
-        media_type: MediaType,
-        download_status: DownloadStatus,
-    },
-}
-
-/// Unified resource in the library (can be a folder or a track)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LibraryItem {
-    Track {
-        id: String,
-        title: String,
-        media_type: MediaType,
-        source: LibrarySource,
-        parent: Option<PathBuf>,
-    },
-    Folder {
-        name: String,
-        path: PathBuf,
-        children: Vec<LibraryItem>,
-    },
+        Some(index) => match mode {
+            "repeat_one" => index,
+            "random" if entries.len() > 1 => {
+                let offset =
+                    (uuid::Uuid::new_v4().as_u128() % (entries.len() - 1) as u128) as usize + 1;
+                (index + offset) % entries.len()
+            }
+            "random" => index,
+            "repeat_all" => (index + if backwards { entries.len() - 1 } else { 1 }) % entries.len(),
+            _ if backwards => index.checked_sub(1)?,
+            _ if index + 1 < entries.len() => index + 1,
+            _ => return None,
+        },
+    };
+    Some(entries[next].id.clone())
 }

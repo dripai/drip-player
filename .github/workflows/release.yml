@@ -28,18 +28,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.6.0
-          standalone: true
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          standalone: false
+          cache: true
+          cache_dependency_path: pnpm-lock.yaml
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -55,7 +54,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build and upload release assets
+      - name: Build and upload draft release assets
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,5 +65,36 @@ jobs:
           releaseName: "Shadow Player ${{ github.ref_name }}"
           releaseBody: |
             Automated release for Shadow Player ${{ github.ref_name }}.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Verify updater metadata
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir release-metadata
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          metadata = json.loads(Path("release-metadata/latest.json").read_text(encoding="utf-8"))
+          if metadata["version"] != tag.removeprefix("v"):
+              raise ValueError("Updater version does not match the release tag")
+          prefix = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}/"
+          for platform in ("windows-x86_64", "darwin-aarch64", "darwin-x86_64"):
+              entry = metadata["platforms"][platform]
+              if not entry["signature"].strip() or not entry["url"].startswith(prefix):
+                  raise ValueError(f"Invalid updater metadata for {platform}")
+          PY
+
+      - name: Publish completed release
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest --verify-tag

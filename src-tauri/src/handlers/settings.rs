@@ -2,43 +2,13 @@ use crate::app_state::{lock, AppState};
 use crate::models::settings::{AppSettings, AppSettingsPatch};
 use crate::services::directory_library::{self, DirectoryUpdate};
 use tauri::{
-    menu::{CheckMenuItem, ContextMenu, Menu, MenuItem},
-    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, Window,
+    menu::CheckMenuItem, AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
 };
 
 pub struct TraySettingsItem(pub CheckMenuItem<tauri::Wry>);
 
 #[derive(Default)]
 pub struct SettingsWindowState(pub tokio::sync::Mutex<()>);
-
-#[tauri::command]
-pub async fn show_app_context_menu(window: Window, locale: String) -> Result<(), String> {
-    let app = window.app_handle();
-    let (refresh_label, settings_label, language) = if locale == "zh" {
-        ("刷新", "设置", "zh")
-    } else {
-        ("Refresh", "Settings", "en")
-    };
-    let refresh = MenuItem::with_id(
-        app,
-        format!("app_refresh:{}", window.label()),
-        refresh_label,
-        true,
-        None::<&str>,
-    )
-    .map_err(|error| error.to_string())?;
-    let settings = MenuItem::with_id(
-        app,
-        format!("app_settings:{language}"),
-        settings_label,
-        true,
-        None::<&str>,
-    )
-    .map_err(|error| error.to_string())?;
-    Menu::with_items(app, &[&refresh, &settings])
-        .and_then(|menu| menu.popup(window))
-        .map_err(|error| error.to_string())
-}
 
 // Window creation runs off the main thread as required by WebView2.
 #[tauri::command]

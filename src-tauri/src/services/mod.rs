@@ -10,10 +10,13 @@ pub mod stream_server;
 pub mod toolchain;
 
 pub mod directory_library;
+pub mod download_options;
 pub mod download_process;
 pub mod download_store;
 pub mod downloads;
+pub mod file_operations;
 pub mod learning;
 pub mod learning_models;
 pub mod media_assets;
 pub mod playback_controller;
+pub mod playlist_files;

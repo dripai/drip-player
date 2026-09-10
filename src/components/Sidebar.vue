@@ -1,23 +1,31 @@
 <script setup lang="ts">
 import { usePlayerStore, type PlaylistItem } from '../store/player'
-import { Music, Video, RefreshCw } from '@lucide/vue'
+import { ref } from 'vue'
+import { Music, Video, RefreshCw, Pencil, Trash2, ListMinus } from '@lucide/vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
+import { openContextMenu } from '../composables/contextMenu'
+import PlaylistFileDialog from './PlaylistFileDialog.vue'
 
 const store = usePlayerStore()
-const { t, locale } = useI18n()
+const { t } = useI18n()
+const fileAction = ref<{ item: PlaylistItem; mode: 'rename' | 'delete' } | null>(null)
 
 async function play(item: PlaylistItem) {
   try { await store.play(item.id) }
   catch (cause) { store.error = String(cause) }
 }
 
-async function showContextMenu(event: MouseEvent, itemId?: string) {
-  event.preventDefault()
-  try {
-    if (itemId) await invoke('show_track_context_menu', { itemId, locale: locale.value })
-    else await invoke('show_playlist_context_menu', { locale: locale.value })
-  } catch (cause) { store.error = String(cause) }
+function showContextMenu(event: MouseEvent, item?: PlaylistItem) {
+  const localFile = item && (item.origin.kind === 'local' || !!item.cached_path)
+  openContextMenu(event, item ? [
+    { id: 'rename', label: t('menu.rename'), icon: Pencil, disabled: !localFile, action: () => { fileAction.value = { item, mode: 'rename' } } },
+    { id: 'remove', label: t('menu.removeFromPlaylist'), icon: ListMinus, action: async () => { await invoke('remove_track', { itemId: item.id }); await store.loadPlaylist(); await store.syncState() } },
+    { id: 'delete', label: t('menu.delete'), icon: Trash2, danger: true, separatorBefore: true, disabled: !localFile, action: () => { fileAction.value = { item, mode: 'delete' } } },
+  ] : [
+    { id: 'refresh', label: t('sidebar.refresh'), icon: RefreshCw, action: () => store.refreshPlaylist() },
+    { id: 'clear', label: t('menu.clearPlaylist'), icon: ListMinus, disabled: !store.playlist.length, action: async () => { await invoke('clear_playlist'); await store.loadPlaylist(); await store.syncState() } },
+  ])
 }
 </script>
 
@@ -33,7 +41,7 @@ async function showContextMenu(event: MouseEvent, itemId?: string) {
       </button>
     </div>
     <div class="flex-1 space-y-0.5 overflow-y-auto p-2">
-      <div v-for="item in store.playlist" :key="item.id" :data-playlist-item-id="item.id" @dblclick="play(item)" @contextmenu="showContextMenu($event, item.id)"
+      <div v-for="item in store.playlist" :key="item.id" :data-playlist-item-id="item.id" tabindex="0" @keydown.enter="play(item)" @dblclick="play(item)" @contextmenu="showContextMenu($event, item)"
         class="group flex cursor-pointer select-none items-center rounded-sm px-2 py-1 transition-colors hover:bg-zinc-200 dark:hover:bg-zinc-800"
         :class="{ 'bg-zinc-200 text-blue-600 dark:bg-zinc-800 dark:text-blue-400': store.currentItemId === item.id }">
         <div class="mr-2 text-zinc-400" :class="{ 'text-blue-500': store.currentItemId === item.id }">
@@ -43,5 +51,6 @@ async function showContextMenu(event: MouseEvent, itemId?: string) {
         <div class="min-w-0 flex-1 truncate text-xs font-medium" :title="item.title">{{ item.title }}</div>
       </div>
     </div>
+    <PlaylistFileDialog v-if="fileAction" :item="fileAction.item" :mode="fileAction.mode" @close="fileAction = null" />
   </div>
 </template>

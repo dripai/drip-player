@@ -1,11 +1,62 @@
+use crate::models::media::MediaType;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadAuth {
+    #[default]
+    Public,
+    Chrome,
+    Edge,
+    Firefox,
+}
+
+impl DownloadAuth {
+    pub fn browser(self) -> Option<&'static str> {
+        match self {
+            Self::Public => None,
+            Self::Chrome => Some("chrome"),
+            Self::Edge => Some("edge"),
+            Self::Firefox => Some("firefox"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DownloadOption {
+    pub id: String,
+    pub media_type: MediaType,
+    pub height: Option<u32>,
+    pub width: Option<u32>,
+    pub format_selector: String,
+    pub extract_audio: bool,
+    pub requires_audio: bool,
+    pub limited_duration: Option<f64>,
+    #[serde(default)]
+    pub video_codec: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownloadFile {
+    pub source_name: String,
+    pub output_name: String,
+    pub stamp: String,
+}
+
+pub enum DownloadAction {
+    Resolve(DownloadAuth),
+    Select { option_id: String, attempt: u64 },
+    Retry,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadPhase {
     Resolving,
+    AwaitingSelection,
     Downloading,
+    Verifying,
     Publishing,
     Completed,
     Failed,
@@ -16,7 +67,10 @@ pub enum DownloadPhase {
 
 impl DownloadPhase {
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Resolving | Self::Downloading | Self::Publishing)
+        matches!(
+            self,
+            Self::Resolving | Self::Downloading | Self::Verifying | Self::Publishing
+        )
     }
 }
 
@@ -38,9 +92,18 @@ pub struct DownloadJob {
     // History of the last attempt, never the source of a retry's destination.
     pub directory: Option<PathBuf>,
     pub output_path: Option<PathBuf>,
+    // Filesystem publication journal, committed before moving any file.
+    #[serde(default)]
+    pub publication: Vec<DownloadFile>,
     pub error: Option<String>,
     pub interrupt_reason: Option<String>,
     pub created_at: u64,
+    #[serde(default)]
+    pub auth: DownloadAuth,
+    #[serde(default)]
+    pub options: Vec<DownloadOption>,
+    pub selection: Option<String>,
+    pub expected_duration: Option<f64>,
     #[serde(skip_deserializing)]
     pub progress: Option<DownloadProgress>,
 }
@@ -56,6 +119,7 @@ impl DownloadJob {
             phase: DownloadPhase::Interrupted,
             directory: None,
             output_path: None,
+            publication: Vec::new(),
             error: None,
             interrupt_reason: None,
             created_at: std::time::SystemTime::now()
@@ -65,6 +129,10 @@ impl DownloadJob {
                 .try_into()
                 .map_err(|_| "Download timestamp overflow")?,
             progress: None,
+            auth: DownloadAuth::Public,
+            options: Vec::new(),
+            selection: None,
+            expected_duration: None,
         })
     }
 }

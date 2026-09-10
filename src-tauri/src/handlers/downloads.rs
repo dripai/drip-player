@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use crate::models::download::DownloadSnapshot;
+use crate::models::download::{DownloadAction, DownloadAuth, DownloadSnapshot};
 use crate::services::downloads;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -47,13 +47,27 @@ pub async fn get_downloads(state: State<'_, AppState>) -> Result<DownloadSnapsho
 }
 
 #[tauri::command]
+pub async fn clear_download_history(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<usize, String> {
+    let state = state.inner().clone();
+    let removed = tauri::async_runtime::spawn_blocking(move || downloads::clear_history(&state))
+        .await
+        .map_err(|error| error.to_string())??;
+    downloads::notify(&app);
+    Ok(removed)
+}
+
+#[tauri::command]
 pub async fn submit_download(
     state: State<'_, AppState>,
     app: AppHandle,
     url: String,
+    auth: DownloadAuth,
 ) -> Result<String, String> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || downloads::submit(&state, &app, url))
+    tauri::async_runtime::spawn_blocking(move || downloads::submit(&state, &app, url, auth))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -65,9 +79,47 @@ pub async fn retry_download(
     job_id: String,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || downloads::retry(&state, &app, &job_id))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        downloads::start(&state, &app, &job_id, DownloadAction::Retry)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn select_download_format(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    job_id: String,
+    option_id: String,
+    attempt: u64,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        downloads::start(
+            &state,
+            &app,
+            &job_id,
+            DownloadAction::Select { option_id, attempt },
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn reparse_download(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    job_id: String,
+    auth: DownloadAuth,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        downloads::start(&state, &app, &job_id, DownloadAction::Resolve(auth))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "engine", rename_all = "snake_case")]
 pub enum PlaybackPlan {
-    BrowserVideo { path: PathBuf },
+    BrowserVideo { path: PathBuf, video_codec: String },
     ExternalVideo { path: PathBuf },
     Audio { path: PathBuf },
 }

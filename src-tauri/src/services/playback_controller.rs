@@ -104,7 +104,8 @@ impl PlaybackController {
             }
             PlaybackPlan::BrowserVideo { .. } => PlaybackStatus::Ready,
             PlaybackPlan::ExternalVideo { path } => {
-                let mpv = OnlineResolver::get_mpv_path().ok_or("MPV is unavailable")?;
+                let mpv = OnlineResolver::get_mpv_path()
+                    .ok_or("此视频格式需要外部播放器，但应用 lib 目录中缺少 mpv；请准备 MPV 或下载 H.264/AAC 格式")?;
                 self.external = Some(
                     toolchain::hidden_command(&mpv)
                         .arg(path)
@@ -261,6 +262,7 @@ mod tests {
                 media,
                 PlaybackPlan::BrowserVideo {
                     path: "fixture.mp4".into(),
+                    video_codec: "h264".into(),
                 },
             )
             .unwrap();

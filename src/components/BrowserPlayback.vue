@@ -4,11 +4,13 @@ import videojs from 'video.js'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { usePlayerStore, type PlaybackSession, type PlaybackSnapshot, type PlaybackStatus } from '../store/player'
 import { useLearningStore } from '../store/learning'
+import { useI18n } from 'vue-i18n'
 
 const props = defineProps<{ session: PlaybackSession }>()
 const emit = defineEmits<{ ready: [player: ReturnType<typeof videojs>, sessionId: number] }>()
 const store = usePlayerStore()
 const learning = useLearningStore()
+const { t } = useI18n()
 // The parent keys this component by session ID. Every callback retains its original owner.
 const sessionId = props.session.id
 const owner = crypto.randomUUID()
@@ -39,6 +41,12 @@ async function reportError(message: string) {
   catch (error) { store.error = String(error) }
 }
 
+function videoErrorMessage(code: number | undefined, message?: string) {
+  const plan = props.session.plan
+  return plan?.engine === 'browser_video' && plan.video_codec === 'hevc' && (code === 3 || code === 4)
+    ? t('player.hevcUnsupported') : message || t('player.videoFailed')
+}
+
 function bindPlayer(instance: ReturnType<typeof videojs>) {
   instance.on('loadedmetadata', async () => {
     if (disposed || store.session?.id !== sessionId) return
@@ -47,7 +55,10 @@ function bindPlayer(instance: ReturnType<typeof videojs>) {
       try { await instance.play() }
       catch (error) {
         if ((error as Error).name === 'NotAllowedError') void report('paused')
-        else if ((error as Error).name !== 'AbortError') void reportError(String(error))
+        else if ((error as Error).name !== 'AbortError') {
+          const code = instance.error()?.code ?? ((error as Error).name === 'NotSupportedError' ? 4 : undefined)
+          void reportError(videoErrorMessage(code, String(error)))
+        }
       }
     } else { void report('paused') }
   })
@@ -58,7 +69,10 @@ function bindPlayer(instance: ReturnType<typeof videojs>) {
   instance.on('waiting', () => void report(instance.paused() ? 'paused' : 'buffering'))
   instance.on('seeked', () => void report())
   instance.on('ended', () => void report('ended'))
-  instance.on('error', () => void reportError(instance.error()?.message || 'Video playback failed'))
+  instance.on('error', () => {
+    const error = instance.error()
+    void reportError(videoErrorMessage(error?.code, error?.message))
+  })
 }
 
 onMounted(async () => {

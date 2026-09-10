@@ -154,6 +154,13 @@ async fn prepare_current(state: &AppState, app: &AppHandle, id: u64) -> Result<(
     .await
     .map_err(|error| error.to_string())??;
     let (mut media, subtitles, plan) = prepared;
+    // A file operation may stop this session while probing. Fence stale work
+    // before it can restore subtitle paths or activate the old filename.
+    let _operation = lock(&state.directory_operation)?;
+    let mut playback = lock(&state.playback)?;
+    if !playback.matches(id) {
+        return Ok(());
+    }
     if !subtitles.is_empty() {
         media = lock(&state.database)?.attach_assets(&media.id, &subtitles)?;
     }
@@ -169,7 +176,7 @@ async fn prepare_current(state: &AppState, app: &AppHandle, id: u64) -> Result<(
         app.emit("playlist-updated", ())
             .map_err(|error| error.to_string())?;
     }
-    lock(&state.playback)?.activate(id, media, plan)
+    playback.activate(id, media, plan)
 }
 
 pub fn remove_entries(state: &AppState, entry_id: Option<&str>) -> Result<(), String> {

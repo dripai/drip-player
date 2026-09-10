@@ -77,7 +77,7 @@ export interface PlaybackSession {
   id: number
   media: Media
   playlist_entry_id: string | null
-  plan: { engine: 'browser_video' | 'external_video' | 'audio'; path: string } | null
+  plan: { engine: 'browser_video'; path: string; video_codec: string } | { engine: 'external_video' | 'audio'; path: string } | null
   status: PlaybackStatus
   position: number
   duration: number

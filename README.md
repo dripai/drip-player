@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Shadow Player is a Tauri 2, Vue 3, and Rust desktop media player for local course videos, audio materials, and online media links. It can import files or folders, resolve online media from sites such as YouTube and Bilibili, and choose the playback path from media probing results.
+Shadow Player is a Tauri 2, Vue 3, and Rust desktop media player for local course videos, audio materials, and online media links. It scans a configured media directory, downloads online media from sites such as YouTube and Bilibili, and chooses the playback path from media probing results.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-orange.svg)](https://tauri.app/)
@@ -22,12 +22,12 @@ Shadow Player is a Tauri 2, Vue 3, and Rust desktop media player for local cours
 - Remux cache: compatible H.264/AAC media can be remuxed losslessly into browser-friendly MP4, such as FLV to MP4.
 - Audio backend: audio playback runs through the Rust backend and `rodio`, with FFmpeg processing when needed.
 - External player support: videos that cannot be played through the browser or remux path can use MPV when bundled in `lib/`.
-- Downloads window: use the download icon after Shadowing, paste a URL, and track, cancel or retry tasks. Closing the window keeps downloads running; completed files enter the current playlist without changing playback.
-- Download recovery: tasks persist in SQLite. Unfinished tasks reopen as interrupted and resume manually using the current settings directory. Changing directories stops active downloads; existing files stay in place.
+- Downloads window: analyze a URL, choose an available resolution, then start the download. The selected browser sign-in source is shared by analysis and downloading. MP3 conversion requires an explicit audio-only selection. Closing the window keeps downloads running; verified files enter the current playlist without changing playback. See [download behavior and validation](docs/downloads.md).
+- Download recovery: tasks and quality choices persist in SQLite. Tasks awaiting a choice stay selectable; active tasks reopen as interrupted and resume manually using the current settings directory. An unavailable resolution requires a new choice. Changing directories stops active downloads; existing files stay in place.
 - Subtitle discovery: automatically scans sibling `.srt`, `.vtt`, `.ass`, and `.ssa` files.
 - Shadowing: subtitle timelines, sentence and AB repeat, masking, favorites, local recording and original-audio comparison. Bailian translation/transcription and iFlytek assessment are connected; live cloud validation requires your keys. See the [setup and verification notes](docs/learning-settings.md).
 - Desktop experience: dark mode, custom title bar, playback controls, volume, playback rate, subtitles, and sidebar.
-- Page context menu: refresh the current window or open a separate settings window; playlist removal and clear menus remain available.
+- Context menus share one theme-aware component. The page menu offers refresh and settings; playlist items support file renaming, membership removal and confirmed permanent media-file deletion. See [playlist file operations](docs/playlist-files.md).
 - General settings: appearance (system, light, dark), interface language, and close to system tray, saved automatically.
 - The settings window has a theme-aware custom title bar with dragging and an independent close button.
 - SQLite storage for download tasks, playlists, media metadata and asset associations, appearance, language, play mode, and close-to-tray settings.
@@ -37,10 +37,12 @@ Shadow Player is a Tauri 2, Vue 3, and Rust desktop media player for local cours
 
 Shadow Player does not rely only on file extensions. Local files and cached files are probed first:
 
-1. If the container and codecs are browser-compatible, the built-in video player is used directly.
+1. Browser-compatible containers/codecs, including H.264, HEVC and AV1 in MP4, use the built-in video player. HEVC decoding depends on the WebView and OS; a decoder failure is reported without forcing external MPV. See [Windows requirements](https://learn.microsoft.com/en-us/troubleshoot/microsoft-edge/development/video-playback-issues).
 2. If the media can be remuxed losslessly into browser-compatible MP4, Shadow Player writes a local remux cache and plays that file.
 3. If the file is audio-only, it is played by the Rust audio backend.
 4. If the file is video that cannot use the browser path, and MPV is present in the bundled `lib/` directory, MPV is used.
+
+Missing probe tools and probe failures are reported directly instead of selecting an engine from the extension. Downloads prefer H.264/AAC at the selected resolution and publish files directly into the configured directory; conflicting media/subtitle names receive a shared numeric suffix. See [download behavior](docs/downloads.md).
 
 Common input formats:
 

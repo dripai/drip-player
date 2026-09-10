@@ -1,5 +1,4 @@
 use crate::models::media::MediaType;
-use crate::services::media_capabilities;
 use crate::services::toolchain;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -14,6 +13,8 @@ pub struct MediaInfo {
     pub audio_codec: Option<String>,
     pub has_video: bool,
     pub has_audio: bool,
+    pub video_height: Option<u32>,
+    pub video_width: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,10 +34,24 @@ struct FfprobeFormat {
 struct FfprobeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+    height: Option<u32>,
+    width: Option<u32>,
+    disposition: Option<FfprobeDisposition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeDisposition {
+    attached_pic: Option<u8>,
 }
 
 pub fn probe(path: &Path) -> Option<MediaInfo> {
-    let output = toolchain::hidden_command(&toolchain::ffprobe_path())
+    probe_required(path).ok()
+}
+
+pub fn probe_required(path: &Path) -> Result<MediaInfo, String> {
+    let ffprobe = toolchain::find_tool("ffprobe")
+        .ok_or("缺少媒体检测工具 ffprobe，请重新准备应用工具目录")?;
+    let output = toolchain::hidden_command(&ffprobe.to_string_lossy())
         .args([
             "-v",
             "error",
@@ -47,41 +62,52 @@ pub fn probe(path: &Path) -> Option<MediaInfo> {
         ])
         .arg(path)
         .output()
-        .ok()?;
+        .map_err(|error| format!("无法检测媒体文件：{error}"))?;
 
     if !output.status.success() {
-        println!("ffprobe failed for {:?}", path);
-        return None;
+        return Err(format!(
+            "媒体检测失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
 
-    let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout).ok()?;
-    let video_codec = parsed
+    parse_output(&output.stdout)
+}
+
+pub fn parse_output(bytes: &[u8]) -> Result<MediaInfo, String> {
+    let parsed: FfprobeOutput = serde_json::from_slice(bytes)
+        .map_err(|error| format!("Invalid ffprobe output: {error}"))?;
+    let video = parsed.streams.iter().find(|stream| {
+        stream.codec_type.as_deref() == Some("video")
+            && stream
+                .disposition
+                .as_ref()
+                .is_none_or(|value| value.attached_pic != Some(1))
+    });
+    let audio = parsed
         .streams
         .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("video"))
-        .and_then(|stream| stream.codec_name.clone());
-    let audio_codec = parsed
-        .streams
-        .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("audio"))
-        .and_then(|stream| stream.codec_name.clone());
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+    let video_codec = video.and_then(|stream| stream.codec_name.clone());
+    let audio_codec = audio.and_then(|stream| stream.codec_name.clone());
     let duration_secs = parsed
         .format
         .as_ref()
         .and_then(|format| format.duration.as_ref())
-        .and_then(|duration| duration.parse::<f64>().ok());
+        .and_then(|duration| duration.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
     let container = parsed.format.and_then(|format| format.format_name);
-    let has_video = video_codec.is_some();
-    let has_audio = audio_codec.is_some();
+    let has_video = video.is_some();
+    let has_audio = audio.is_some();
     let media_type = if has_video {
         MediaType::Video
     } else if has_audio {
         MediaType::Audio
     } else {
-        media_capabilities::media_type_from_path(path)
+        return Err("No audio or video streams found".into());
     };
 
-    Some(MediaInfo {
+    Ok(MediaInfo {
         media_type,
         duration_secs,
         container,
@@ -89,6 +115,8 @@ pub fn probe(path: &Path) -> Option<MediaInfo> {
         audio_codec,
         has_video,
         has_audio,
+        video_height: video.and_then(|stream| stream.height),
+        video_width: video.and_then(|stream| stream.width),
     })
 }
 
@@ -110,12 +138,14 @@ pub fn is_browser_native(info: &MediaInfo) -> bool {
     }
 
     is_mp4_family_container(container)
-        && matches!(video_codec, "h264" | "av1")
+        // HEVC decoding is provided by the WebView/OS. Let the actual video
+        // element report unsupported decoding instead of forcing external MPV.
+        && matches!(video_codec, "h264" | "av1" | "hevc")
         && (audio_codec.is_empty() || matches!(audio_codec, "aac" | "mp3" | "alac" | "opus"))
 }
 
 pub fn can_remux_to_browser_mp4(info: &MediaInfo) -> bool {
-    matches!(info.video_codec.as_deref(), Some("h264"))
+    matches!(info.video_codec.as_deref(), Some("h264" | "hevc"))
         && matches!(
             info.audio_codec.as_deref(),
             None | Some("aac") | Some("mp3") | Some("opus")
@@ -146,6 +176,8 @@ mod tests {
             audio_codec: Some("opus".to_string()),
             has_video: true,
             has_audio: true,
+            video_height: None,
+            video_width: None,
         };
 
         assert!(can_remux_to_browser_mp4(&info));

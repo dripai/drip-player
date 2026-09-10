@@ -1,7 +1,7 @@
-use crate::models::media::MediaType;
+use crate::models::download::{DownloadAuth, DownloadOption};
+use crate::services::download_options::VideoMetadata;
 use crate::services::download_process::{run_command, DownloadControl};
 use crate::services::toolchain;
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -10,14 +10,6 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-#[derive(Debug, Clone)]
-enum AuthStrategy {
-    /// No authentication - try without any cookies
-    None,
-    /// Use cookies from browser (chrome, edge, firefox)
-    Browser(&'static str),
-}
 
 /// Supported video platforms with their specific configurations
 #[derive(Debug, Clone, PartialEq)]
@@ -76,18 +68,6 @@ impl VideoPlatform {
         }
     }
 
-    /// Check if this platform typically requires cookies for full access
-    pub fn needs_cookies(&self) -> bool {
-        match self {
-            VideoPlatform::Bilibili => true, // For high quality
-            VideoPlatform::YouTube => true,  // For age-restricted content
-            VideoPlatform::Douyin => true,   // Often needs login
-            VideoPlatform::TencentVideo => true,
-            VideoPlatform::Weixin => true,
-            VideoPlatform::Generic => false,
-        }
-    }
-
     /// Get the login URL for this platform
     pub fn get_login_url(&self) -> &'static str {
         match self {
@@ -121,29 +101,14 @@ impl VideoPlatform {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct VideoMetadata {
-    pub title: String,
-    pub id: String,
-    pub vcodec: Option<String>,
-}
-
-impl VideoMetadata {
-    pub fn get_media_type(&self) -> MediaType {
-        match &self.vcodec {
-            Some(v) if v != "none" => MediaType::Video,
-            _ => MediaType::Audio,
-        }
-    }
-}
-
 pub struct OnlineResolver;
 
 pub struct DownloadRequest<'a> {
     pub url: &'a str,
     pub title: &'a str,
     pub output_dir: &'a Path,
-    pub media_type: &'a MediaType,
+    pub option: &'a DownloadOption,
+    pub auth: DownloadAuth,
     pub extra_subtitle_lang: Option<&'a str>,
 }
 
@@ -158,6 +123,16 @@ fn hidden_command(program: &str) -> Command {
 #[cfg(not(windows))]
 fn hidden_command(program: &str) -> Command {
     Command::new(program)
+}
+
+fn configure_source(cmd: &mut Command, platform: &VideoPlatform, auth: DownloadAuth) {
+    cmd.args(["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"]);
+    if let Some(referer) = platform.get_referer() {
+        cmd.arg("--referer").arg(referer);
+    }
+    if let Some(browser) = auth.browser() {
+        cmd.arg("--cookies-from-browser").arg(browser);
+    }
 }
 
 impl OnlineResolver {
@@ -237,119 +212,48 @@ impl OnlineResolver {
         toolchain::find_tool("ffmpeg").map(|path| path.to_string_lossy().to_string())
     }
 
-    pub fn resolve_metadata(url: &str, control: &DownloadControl) -> Result<VideoMetadata, String> {
-        let (yt_dlp_cmd, _) = Self::get_tools_paths();
+    pub fn resolve_metadata(
+        url: &str,
+        auth: DownloadAuth,
+        control: &DownloadControl,
+    ) -> Result<VideoMetadata, String> {
+        let (yt_dlp, _) = Self::get_tools_paths();
         let platform = VideoPlatform::from_url(url);
-
-        println!(
-            "Resolving metadata for platform: {} ({})",
-            platform.display_name(),
-            url
-        );
-
-        // Strategy order:
-        // 1. No auth (try without cookies first)
-        // 2. Browser cookies (chrome, edge, firefox)
-        // 3. If all fail and login required, return special error for OAuth/manual login
-        let strategies = vec![
-            AuthStrategy::None, // Try without auth first
-            AuthStrategy::Browser("chrome"),
-            AuthStrategy::Browser("edge"),
-            AuthStrategy::Browser("firefox"),
-        ];
-        let mut last_error = String::new();
-        let mut needs_login = false;
-
-        for strategy in &strategies {
-            control.check()?;
-            let strategy_name = match strategy {
-                AuthStrategy::None => "none".to_string(),
-                AuthStrategy::Browser(b) => format!("browser:{}", b),
-            };
-            println!("Trying strategy: {}", strategy_name);
-
-            let mut cmd = hidden_command(&yt_dlp_cmd);
-            cmd.arg("--ignore-config").arg("--encoding").arg("utf-8").arg("--dump-json")
-               .arg("--no-playlist")
-               .arg("--no-warnings")
-               .arg("--user-agent")
-               .arg("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-
-            // For YouTube, add special options to help bypass bot detection
-            if platform == VideoPlatform::YouTube {
-                cmd.arg("--extractor-args")
-                    .arg("youtube:player_client=web,default");
+        let mut cmd = hidden_command(&yt_dlp);
+        cmd.args([
+            "--ignore-config",
+            "--encoding",
+            "utf-8",
+            "--dump-json",
+            "--no-playlist",
+            "--no-warnings",
+        ]);
+        configure_source(&mut cmd, &platform, auth);
+        cmd.arg(url);
+        let output = run_command(cmd, control, true, |_| Ok(()))?;
+        if !output.status.success() {
+            let lower = output.stderr.to_lowercase();
+            if !platform.get_login_url().is_empty()
+                && ["sign in", "login", "log in"]
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+            {
+                return Err(format!(
+                    "LOGIN_REQUIRED:{}:{}:{}",
+                    platform.display_name(),
+                    platform.get_login_url(),
+                    output.stderr.trim()
+                ));
             }
-
-            // Add platform-specific referer if needed
-            if let Some(referer) = platform.get_referer() {
-                cmd.arg("--referer").arg(referer);
-            }
-
-            match strategy {
-                AuthStrategy::None => {}
-                AuthStrategy::Browser(b) => {
-                    cmd.arg("--cookies-from-browser").arg(*b);
-                }
-            }
-
-            cmd.arg(url);
-            let output = run_command(cmd, control, true, |_| Ok(()))?;
-
-            if output.status.success() {
-                let stdout = &output.stdout;
-
-                // Try to parse each line as JSON
-                for line in stdout.lines() {
-                    if let Ok(metadata) = serde_json::from_str::<VideoMetadata>(line) {
-                        println!(
-                            "Successfully resolved metadata for {}: {} (strategy: {})",
-                            platform.display_name(),
-                            metadata.title,
-                            strategy_name
-                        );
-                        return Ok(metadata);
-                    }
-                }
-
-                let stderr = &output.stderr;
-                last_error = format!("Failed to parse JSON from output. Stderr: {}", stderr);
-                println!("Strategy {} failed: {}", strategy_name, last_error);
-            } else {
-                let stderr = &output.stderr;
-                last_error = stderr.to_string();
-                println!("Strategy {} failed: {}", strategy_name, last_error);
-
-                // Check if this is a login-related error
-                if stderr.contains("Sign in") || stderr.contains("bot") || stderr.contains("login")
-                {
-                    needs_login = true;
-                }
-
-                // Continue to next strategy
-                if stderr.contains("Could not copy") {
-                    // Browser cookie lock error, try next browser
-                    continue;
-                }
-            }
+            return Err(format!("yt-dlp: {}", output.stderr.trim()));
         }
-
-        // If login is needed, return special error code
-        if needs_login && platform.needs_cookies() {
-            // Return error that indicates OAuth should be tried
-            Err(format!(
-                "LOGIN_REQUIRED:{}:{}:{}",
-                platform.display_name(),
-                platform.get_login_url(),
-                last_error
-            ))
-        } else {
-            Err(format!(
-                "yt-dlp error for {} after retries: {}",
-                platform.display_name(),
-                last_error
-            ))
+        let mut entries = output.stdout.lines().filter(|line| !line.trim().is_empty());
+        let metadata = serde_json::from_str(entries.next().ok_or("No media metadata returned")?)
+            .map_err(|error| format!("Invalid media metadata: {error}"))?;
+        if entries.next().is_some() {
+            return Err("The URL contains multiple episodes; use a single episode URL".into());
         }
+        Ok(metadata)
     }
 
     /// Try to resolve metadata using OAuth2 authentication
@@ -435,48 +339,12 @@ impl OnlineResolver {
         on_progress: impl Fn(&str) -> Result<(), String>,
     ) -> Result<PathBuf, String> {
         let platform = VideoPlatform::from_url(request.url);
-        let strategies = if platform.needs_cookies() {
-            vec![
-                AuthStrategy::Browser("chrome"),
-                AuthStrategy::Browser("edge"),
-                AuthStrategy::Browser("firefox"),
-                AuthStrategy::None,
-            ]
-        } else {
-            vec![AuthStrategy::None]
-        };
-        let mut last_error = String::new();
-        for strategy in strategies {
-            control.check()?;
-            match Self::download_media_internal(
-                request,
-                control,
-                &on_progress,
-                &strategy,
-                &platform,
-            ) {
-                Ok(path) => return Ok(path),
-                Err(error) => {
-                    control.check()?;
-                    last_error = error;
-                }
-            }
-        }
-        Err(last_error)
-    }
-
-    fn download_media_internal(
-        request: &DownloadRequest<'_>,
-        control: &DownloadControl,
-        on_progress: &impl Fn(&str) -> Result<(), String>,
-        strategy: &AuthStrategy,
-        platform: &VideoPlatform,
-    ) -> Result<PathBuf, String> {
         let DownloadRequest {
             url,
             title,
             output_dir,
-            media_type,
+            option,
+            auth,
             extra_subtitle_lang,
         } = *request;
         let safe_title = Self::sanitize_filename(title).replace('%', "%%");
@@ -489,37 +357,31 @@ impl OnlineResolver {
             )
         })?;
         let mut cmd = hidden_command(&yt_dlp_cmd);
-        match media_type {
-            MediaType::Video => {
-                cmd.arg("-f")
-                    .arg("bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
-                    .arg("--merge-output-format")
-                    .arg("mp4");
-            }
-            MediaType::Audio => {
-                cmd.arg("-x")
-                    .arg("--audio-format")
-                    .arg("mp3")
-                    .arg("--audio-quality")
-                    .arg("192K");
-            }
+        cmd.arg("-f").arg(&option.format_selector);
+        if option.extract_audio {
+            cmd.args(["-x", "--audio-format", "mp3", "--audio-quality", "192K"]);
+        } else {
+            cmd.args(["--merge-output-format", "mp4"]);
         }
-        cmd.arg("--ignore-config").arg("--encoding").arg("utf-8")
-            .arg("--embed-metadata").arg("--newline").arg("--continue")
-            .arg("--no-simulate").arg("--progress").arg("--progress-delta").arg("0.5")
-            .arg("--progress-template").arg("download:__SHADOW_PROGRESS__%(progress)j")
-            .arg("--print").arg("after_move:__SHADOW_FILE__%(filepath)j")
-            .arg("--user-agent").arg("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        if let Some(referer) = platform.get_referer() {
-            cmd.arg("--referer").arg(referer);
-        }
+        cmd.arg("--ignore-config")
+            .arg("--encoding")
+            .arg("utf-8")
+            .arg("--embed-metadata")
+            .arg("--newline")
+            .arg("--continue")
+            .arg("--no-simulate")
+            .arg("--progress")
+            .arg("--progress-delta")
+            .arg("0.5")
+            .arg("--progress-template")
+            .arg("download:__SHADOW_PROGRESS__%(progress)j")
+            .arg("--print")
+            .arg("after_move:__SHADOW_FILE__%(filepath)j");
+        configure_source(&mut cmd, &platform, auth);
         let sub_langs = extra_subtitle_lang
             .map(|lang| format!("zh,en,{lang}"))
             .unwrap_or_else(|| "zh,en".into());
         cmd.arg("--write-subs").arg("--sub-langs").arg(sub_langs);
-        if let AuthStrategy::Browser(browser) = strategy {
-            cmd.arg("--cookies-from-browser").arg(browser);
-        }
         cmd.arg("-o")
             .arg(output_template)
             .arg("--ffmpeg-location")
@@ -624,15 +486,22 @@ mod download_tests {
         let temp = tempfile::tempdir().unwrap();
         let directory = dunce::canonicalize(temp.path()).unwrap();
         let control = DownloadControl::default();
-        let metadata = OnlineResolver::resolve_metadata(&url, &control).unwrap();
+        let metadata =
+            OnlineResolver::resolve_metadata(&url, DownloadAuth::Public, &control).unwrap();
         assert!(!metadata.title.is_empty());
+        let options = metadata.download_options().unwrap();
+        let option = options
+            .iter()
+            .find(|option| option.id == "audio:mp3")
+            .unwrap();
         let progress = AtomicUsize::new(0);
         let path = OnlineResolver::download_media(
             &DownloadRequest {
                 url: &url,
                 title: "本地下载测试 100%",
                 output_dir: &directory,
-                media_type: &MediaType::Audio,
+                option,
+                auth: DownloadAuth::Public,
                 extra_subtitle_lang: None,
             },
             &control,

@@ -277,6 +277,9 @@ impl PersistenceManager {
             return Err("保存目录已切换，本次下载未加入播放列表".into());
         }
         let mut job = crate::services::download_store::active_job(&tx, job_id, attempt)?;
+        if job.phase != crate::models::download::DownloadPhase::Publishing {
+            return Err("下载文件尚未通过校验并进入发布阶段".into());
+        }
         if job.media_id.as_deref() != Some(media_id)
             || job.directory.as_ref() != Some(&directory.path)
         {
@@ -290,6 +293,20 @@ impl PersistenceManager {
         tx.execute(
             "DELETE FROM media_assets WHERE media_id = ?1 AND source = 'download'",
             [media_id],
+        )
+        .map_err(database_error)?;
+        let option = job
+            .options
+            .iter()
+            .find(|option| Some(&option.id) == job.selection.as_ref())
+            .ok_or("下载任务缺少已校验的格式选择")?;
+        let kind = match option.media_type {
+            crate::models::media::MediaType::Audio => "Audio",
+            crate::models::media::MediaType::Video => "Video",
+        };
+        tx.execute(
+            "UPDATE media SET title = ?1, media_type = ?2 WHERE id = ?3",
+            params![job.title, kind, media_id],
         )
         .map_err(database_error)?;
         put_assets(&tx, media_id, assets)?;
@@ -318,6 +335,7 @@ impl PersistenceManager {
                 .clone(),
         );
         job.phase = crate::models::download::DownloadPhase::Completed;
+        job.publication.clear();
         job.error = None;
         crate::services::download_store::write_job(&tx, &job)?;
         let revision = advance_revision(&tx, self.playlist_revision)?;
@@ -524,7 +542,20 @@ mod tests {
             crate::models::download::DownloadJob::new("https://youtu.be/fixture".into()).unwrap();
         job.media_id = Some(remote.id.clone());
         job.directory = Some(directory.path.clone());
-        job.phase = crate::models::download::DownloadPhase::Downloading;
+        job.phase = crate::models::download::DownloadPhase::Publishing;
+        job.title = remote.title.clone();
+        job.selection = Some("audio:original".into());
+        job.options = vec![crate::models::download::DownloadOption {
+            video_codec: None,
+            id: "audio:original".into(),
+            media_type: MediaType::Audio,
+            height: None,
+            width: None,
+            format_selector: "audio".into(),
+            extract_audio: false,
+            requires_audio: true,
+            limited_duration: None,
+        }];
         db.save_download_job(&job).unwrap();
         db.publish_directory_download(&directory, &remote.id, &assets, &job.id, job.attempt)
             .unwrap();

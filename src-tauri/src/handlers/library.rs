@@ -4,6 +4,7 @@ use crate::models::library::LibraryItem;
 use crate::models::media::{AssetKind, MediaAsset};
 use crate::models::playlist::PlaylistSnapshot;
 use crate::services::media_capabilities;
+use crate::services::playlist_files::{self, PlaylistFile};
 use std::path::Path;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
@@ -11,6 +12,66 @@ use tauri_plugin_dialog::DialogExt;
 #[tauri::command]
 pub fn get_playlist(state: State<AppState>) -> Result<PlaylistSnapshot, String> {
     application::playlist_snapshot(&state)
+}
+
+#[tauri::command]
+pub async fn get_playlist_file(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<PlaylistFile, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || playlist_files::get_file(&state, &item_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+async fn change_file(
+    app: AppHandle,
+    state: AppState,
+    target: PlaylistFile,
+    name: Option<String>,
+) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || match name {
+        Some(name) => playlist_files::rename(&state, &target, &name),
+        None => playlist_files::delete(&state, &target),
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+    let mut errors: Vec<String> = result.err().into_iter().collect();
+    for event in [
+        "playlist-updated",
+        "player-state-changed",
+        "downloads-updated",
+    ] {
+        if let Err(error) = app.emit(event, ()) {
+            errors.push(format!("文件操作结束，但窗口通知失败：{error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+#[tauri::command]
+pub async fn rename_playlist_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target: PlaylistFile,
+    name: String,
+) -> Result<(), String> {
+    change_file(app, state.inner().clone(), target, Some(name)).await
+}
+
+#[tauri::command]
+pub async fn delete_playlist_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target: PlaylistFile,
+) -> Result<(), String> {
+    change_file(app, state.inner().clone(), target, None).await
 }
 
 #[tauri::command]

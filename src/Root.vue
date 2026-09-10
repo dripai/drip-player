@@ -9,6 +9,9 @@ import App from './App.vue'
 import SettingsWindow from './components/SettingsWindow.vue'
 import DownloadsWindow from './components/DownloadsWindow.vue'
 import { useDownloadsStore } from './store/downloads'
+import { RefreshCw, Settings } from '@lucide/vue'
+import ContextMenu from './components/ContextMenu.vue'
+import { closeContextMenu, openContextMenu } from './composables/contextMenu'
 
 const currentWindow = getCurrentWindow()
 const isSettings = currentWindow.label === 'settings'
@@ -35,16 +38,19 @@ watch(() => [settings.ready, locale.value] as const, ([ready]) => {
 
 function reloadSettings() { window.location.reload() }
 
-async function showContextMenu(event: MouseEvent) {
-  // Playlist menus handle their own contextmenu event before it bubbles here.
+function showContextMenu(event: MouseEvent) {
   if (event.defaultPrevented) return
-  event.preventDefault()
-  try {
-    await invoke('show_app_context_menu', { locale: locale.value })
-  } catch (cause) {
-    error.value = String(cause)
+  if (event.target instanceof Element && event.target.closest('dialog[open]')) {
+    event.preventDefault()
+    return
   }
+  openContextMenu(event, [
+    { id: 'refresh', label: t('menu.refresh'), icon: RefreshCw, action: () => window.location.reload() },
+    { id: 'settings', label: t('settings.title'), icon: Settings, action: async () => { await invoke('open_settings_window', { locale: locale.value }) } },
+  ])
 }
+
+watch(() => [settings.isDark, locale.value], closeContextMenu)
 
 onMounted(async () => {
   document.addEventListener('contextmenu', showContextMenu)
@@ -69,6 +75,7 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <ContextMenu @error="error = $event" />
   <template v-if="settings.ready">
     <SettingsWindow v-if="isSettings" />
     <DownloadsWindow v-else-if="isDownloads" />

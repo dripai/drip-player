@@ -10,9 +10,7 @@ mod models;
 mod services;
 
 use app_state::AppState;
-use handlers::{
-    downloads::*, learning::*, library::*, menus::*, platform::*, playback::*, settings::*,
-};
+use handlers::{downloads::*, learning::*, library::*, platform::*, playback::*, settings::*};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
@@ -108,23 +106,7 @@ fn main() {
             app.on_menu_event(move |app, event| {
                 let event_id = event.id().as_ref();
 
-                if let Some(label) = event_id.strip_prefix("app_refresh:") {
-                    if let Some(window) = app.get_webview_window(label) {
-                        if let Err(error) = window.eval("window.location.reload()") {
-                            let _ = window.emit("app-error", error.to_string());
-                        }
-                    }
-                    return;
-                } else if let Some(locale) = event_id.strip_prefix("app_settings:") {
-                    let app = app.clone();
-                    let locale = locale.to_string();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(error) = open_settings_window(app.clone(), locale).await {
-                            let _ = app.emit("app-error", error);
-                        }
-                    });
-                    return;
-                } else if event_id == "tray_quit" {
+                if event_id == "tray_quit" {
                     app.exit(0);
                 } else if event_id == "tray_restore" {
                     if let Some(window) = app.get_webview_window("main") {
@@ -137,16 +119,6 @@ fn main() {
                         let _ = app.emit("app-error", error);
                     }
                 }
-                if event_id.starts_with("remove_item:") || event_id == "clear_playlist" {
-                    let id = event_id.strip_prefix("remove_item:").map(str::to_string);
-                    let state = state_for_menu.clone();
-                    let app = app.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        if let Err(error) = remove_and_notify(&state, &app, id.as_deref()) {
-                            let _ = app.emit("app-error", error);
-                        }
-                    });
-                }
             });
 
             Ok(())
@@ -154,22 +126,25 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_playlist,
             refresh_playlist,
+            get_playlist_file,
+            rename_playlist_file,
+            delete_playlist_file,
             play_item,
             play_track_directly,
             pause,
             resume,
             open_downloads_window,
             get_downloads,
+            clear_download_history,
             submit_download,
+            select_download_format,
+            reparse_download,
             retry_download,
             cancel_download,
             add_local_files,
             pick_and_add_local_files,
             pick_and_add_folder,
             get_folder_tree,
-            show_track_context_menu,
-            show_playlist_context_menu,
-            show_app_context_menu,
             open_settings_window,
             get_app_settings,
             update_app_settings,

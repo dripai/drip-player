@@ -1,339 +1,301 @@
-use crate::models::playlist::{
-    canonical_local_identity, LibraryItem, Playlist, PlaylistEntry, PlaylistItem, PlaylistOrigin,
-    PlaylistStateFile,
-};
-use serde::de::DeserializeOwned;
+use crate::models::playlist::{MediaType, PlaylistItem, PlaylistOrigin};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::Write;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-const PLAYLIST_SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: i64 = 1;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize)]
 pub struct AppSettings {
+    pub revision: u64,
+    pub theme: String,
+    pub language: String,
+    pub play_mode: String,
     pub minimize_to_tray: bool,
 }
 
-pub struct PersistenceManager;
-
-impl PersistenceManager {
-    fn config_dir() -> PathBuf {
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-            .join("config")
-    }
-
-    fn playlist_state_path() -> PathBuf {
-        Self::config_dir().join("playlist_v2.json")
-    }
-
-    fn legacy_playlist_path() -> PathBuf {
-        Self::config_dir().join("playlist.json")
-    }
-
-    fn legacy_library_path() -> PathBuf {
-        Self::config_dir().join("library.json")
-    }
-
-    fn legacy_playlist_entries_path() -> PathBuf {
-        Self::config_dir().join("playlist_entries.json")
-    }
-
-    fn settings_path() -> PathBuf {
-        Self::config_dir().join("settings.json")
-    }
-
-    fn ensure_config_dir() -> Result<PathBuf, String> {
-        let dir = Self::config_dir();
-        fs::create_dir_all(&dir).map_err(|error| {
-            format!(
-                "Failed to create config directory {}: {error}",
-                dir.display()
-            )
-        })?;
-        Ok(dir)
-    }
-
-    pub fn load_playlist_state() -> Result<PlaylistStateFile, String> {
-        let path = Self::playlist_state_path();
-        if let Some(state) = Self::load_optional_json::<PlaylistStateFile>(&path)? {
-            Self::validate_playlist_state(&state)?;
-            return Ok(state);
-        }
-
-        let migrated = Self::migrate_legacy_playlist()?;
-        Self::save_playlist_state(&migrated)?;
-        Ok(migrated)
-    }
-
-    pub fn save_playlist_state(state: &PlaylistStateFile) -> Result<(), String> {
-        Self::validate_playlist_state(state)?;
-        Self::ensure_config_dir()?;
-        let path = Self::playlist_state_path();
-        Self::write_playlist_state(&path, state)
-    }
-
-    fn write_playlist_state(path: &Path, state: &PlaylistStateFile) -> Result<(), String> {
-        let dir = path
-            .parent()
-            .ok_or_else(|| format!("Playlist path has no parent: {}", path.display()))?;
-        fs::create_dir_all(dir)
-            .map_err(|error| format!("Failed to create playlist directory: {error}"))?;
-        let mut temp = tempfile::NamedTempFile::new_in(&dir)
-            .map_err(|error| format!("Failed to create playlist temp file: {error}"))?;
-        serde_json::to_writer_pretty(temp.as_file_mut(), state)
-            .map_err(|error| format!("Failed to serialize playlist state: {error}"))?;
-        temp.as_file_mut()
-            .write_all(b"\n")
-            .map_err(|error| format!("Failed to finish playlist temp file: {error}"))?;
-        temp.as_file_mut()
-            .flush()
-            .map_err(|error| format!("Failed to flush playlist temp file: {error}"))?;
-        temp.as_file()
-            .sync_all()
-            .map_err(|error| format!("Failed to sync playlist temp file: {error}"))?;
-        temp.persist(&path).map_err(|error| {
-            format!(
-                "Failed to atomically replace playlist state {}: {}",
-                path.display(),
-                error.error
-            )
-        })?;
-        Ok(())
-    }
-
-    fn validate_playlist_state(state: &PlaylistStateFile) -> Result<(), String> {
-        if state.schema_version != PLAYLIST_SCHEMA_VERSION {
-            return Err(format!(
-                "Unsupported playlist schema version: {}",
-                state.schema_version
-            ));
-        }
-
-        let mut ids = HashSet::new();
-        let mut canonical_keys = HashSet::new();
-        for item in &state.items {
-            if item.id.trim().is_empty() || item.canonical_key.trim().is_empty() {
-                return Err("Playlist contains an item without a stable identity".to_string());
-            }
-            if !ids.insert(item.id.clone()) {
-                return Err(format!("Duplicate playlist item id: {}", item.id));
-            }
-            if !canonical_keys.insert(item.canonical_key.clone()) {
-                return Err(format!(
-                    "Duplicate playlist media identity: {}",
-                    item.canonical_key
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn migrate_legacy_playlist() -> Result<PlaylistStateFile, String> {
-        let library = Self::load_optional_json::<Vec<LibraryItem>>(&Self::legacy_library_path())?
-            .unwrap_or_default();
-        let entries =
-            Self::load_optional_json::<Vec<PlaylistEntry>>(&Self::legacy_playlist_entries_path())?
-                .unwrap_or_default();
-        let mut library_by_id = HashMap::new();
-        for item in &library {
-            Self::collect_library_tracks(item, &mut library_by_id);
-        }
-
-        let mut items = Vec::new();
-        let mut seen = HashSet::new();
-        for entry in entries {
-            let Some(library_item) = library_by_id.get(&entry.item_id) else {
-                continue;
-            };
-            let Some(item) = PlaylistItem::from_library_item(library_item, entry.added_at) else {
-                continue;
-            };
-            if seen.insert(item.canonical_key.clone()) {
-                items.push(item);
-            }
-        }
-
-        if items.is_empty() {
-            let legacy_playlist =
-                Self::load_optional_json::<Playlist>(&Self::legacy_playlist_path())?
-                    .unwrap_or_else(Playlist::new);
-            for track in &legacy_playlist.tracks {
-                let library_item = Playlist::track_to_library_item(track);
-                let added_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let Some(item) = PlaylistItem::from_library_item(&library_item, added_at) else {
-                    continue;
-                };
-                if seen.insert(item.canonical_key.clone()) {
-                    items.push(item);
-                }
-            }
-        }
-
-        Self::remove_cached_local_duplicates(&mut items);
-
-        Ok(PlaylistStateFile {
-            schema_version: PLAYLIST_SCHEMA_VERSION,
-            revision: u64::from(!items.is_empty()),
-            items,
-        })
-    }
-
-    fn remove_cached_local_duplicates(items: &mut Vec<PlaylistItem>) {
-        let cached_local_keys = items
-            .iter()
-            .filter_map(|item| match &item.origin {
-                PlaylistOrigin::Remote { .. } => item
-                    .cached_path
-                    .as_ref()
-                    .map(|path| canonical_local_identity(path).1),
-                PlaylistOrigin::Local { .. } => None,
-            })
-            .collect::<HashSet<_>>();
-        items.retain(|item| {
-            !matches!(item.origin, PlaylistOrigin::Local { .. })
-                || !cached_local_keys.contains(&item.canonical_key)
-        });
-    }
-
-    fn collect_library_tracks<'a>(
-        item: &'a LibraryItem,
-        target: &mut HashMap<String, &'a LibraryItem>,
-    ) {
-        match item {
-            LibraryItem::Track { id, .. } => {
-                target.entry(id.clone()).or_insert(item);
-            }
-            LibraryItem::Folder { children, .. } => {
-                for child in children {
-                    Self::collect_library_tracks(child, target);
-                }
-            }
-        }
-    }
-
-    fn load_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = fs::read_to_string(path)
-            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        serde_json::from_str(&content)
-            .map(Some)
-            .map_err(|error| format!("Failed to parse {}: {error}", path.display()))
-    }
-
-    pub fn save_settings(settings: &AppSettings) {
-        if let Ok(dir) = Self::ensure_config_dir() {
-            let path = dir.join("settings.json");
-            if let Ok(json) = serde_json::to_string_pretty(settings) {
-                let _ = fs::write(path, json);
-            }
-        }
-    }
-
-    pub fn load_settings() -> AppSettings {
-        Self::load_optional_json(&Self::settings_path())
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    }
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppSettingsPatch {
+    pub theme: Option<String>,
+    pub language: Option<String>,
+    pub play_mode: Option<String>,
+    pub minimize_to_tray: Option<bool>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::playlist::MediaType;
+pub struct StoredPlaylist {
+    pub revision: u64,
+    pub items: Vec<PlaylistItem>,
+}
 
-    fn playlist_item(id: &str, canonical_key: &str) -> PlaylistItem {
-        PlaylistItem {
-            id: id.to_string(),
-            canonical_key: canonical_key.to_string(),
-            title: id.to_string(),
-            media_type: MediaType::Audio,
-            origin: PlaylistOrigin::Local {
-                path: PathBuf::from(format!("C:/media/{id}.mp3")),
-            },
-            cached_path: None,
-            added_at: 1,
+pub struct PersistenceManager {
+    connection: Connection,
+}
+
+fn database_error(error: rusqlite::Error) -> String {
+    format!("SQLite: {error}")
+}
+
+fn path_text(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| "Media path cannot be represented as UTF-8".to_string())
+}
+
+impl PersistenceManager {
+    pub fn open() -> Result<Self, String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Failed to locate executable: {error}"))?;
+        let directory = executable
+            .parent()
+            .ok_or_else(|| "Executable has no parent directory".to_string())?
+            .join("config");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("Failed to create {}: {error}", directory.display()))?;
+        let path = directory.join("drip-player.sqlite3");
+        let mut connection = Connection::open(&path)
+            .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(database_error)?;
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(database_error)?;
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(database_error)?;
+        if journal_mode != "wal" {
+            return Err(format!("SQLite WAL mode unavailable: {journal_mode}"));
         }
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(database_error)?;
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let version: i64 = transaction
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(database_error)?;
+        match version {
+            0 => {
+                let tables: i64 = transaction
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                if tables != 0 {
+                    return Err("SQLite database contains an unrecognized schema".to_string());
+                }
+                transaction
+                    .execute_batch(include_str!("schema.sql"))
+                    .map_err(database_error)?;
+            }
+            SCHEMA_VERSION => {}
+            _ => return Err(format!("Unsupported SQLite schema version: {version}")),
+        }
+        transaction.commit().map_err(database_error)?;
+        Ok(Self { connection })
     }
 
-    #[test]
-    fn playlist_state_rejects_duplicate_media_identity() {
-        let state = PlaylistStateFile {
-            schema_version: PLAYLIST_SCHEMA_VERSION,
-            revision: 1,
-            items: vec![
-                playlist_item("one", "local:c:/media/song.mp3"),
-                playlist_item("two", "local:c:/media/song.mp3"),
-            ],
+    pub fn load_playlist(&self) -> Result<StoredPlaylist, String> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(database_error)?;
+        let revision = transaction
+            .query_row(
+                "SELECT revision FROM playlist_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let items = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT p.id, m.canonical_key, m.title, m.media_type, m.origin_kind,
+                            m.local_path, m.remote_url, m.provider, m.external_id, m.cached_path, p.added_at, m.id
+                     FROM playlist_entries p JOIN media m ON m.id = p.media_id ORDER BY p.position",
+                )
+                .map_err(database_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    let media_type: String = row.get(3)?;
+                    let origin_kind: String = row.get(4)?;
+                    let media_type = match media_type.as_str() {
+                        "Audio" => MediaType::Audio,
+                        "Video" => MediaType::Video,
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
+                    let origin = match origin_kind.as_str() {
+                        "local" => PlaylistOrigin::Local {
+                            path: PathBuf::from(row.get::<_, String>(5)?),
+                        },
+                        "remote" => PlaylistOrigin::Remote {
+                            url: row.get(6)?,
+                            provider: row.get(7)?,
+                            external_id: row.get(8)?,
+                        },
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
+                    Ok(PlaylistItem {
+                        id: row.get(0)?,
+                        media_id: row.get(11)?,
+                        canonical_key: row.get(1)?,
+                        title: row.get(2)?,
+                        media_type,
+                        origin,
+                        cached_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+                        added_at: row.get(10)?,
+                    })
+                })
+                .map_err(database_error)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?
         };
-
-        assert!(PersistenceManager::validate_playlist_state(&state).is_err());
+        transaction.commit().map_err(database_error)?;
+        Ok(StoredPlaylist { revision, items })
     }
 
-    #[test]
-    fn playlist_state_atomically_replaces_existing_file() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("playlist_v2.json");
-        let mut state = PlaylistStateFile {
-            schema_version: PLAYLIST_SCHEMA_VERSION,
-            revision: 1,
-            items: vec![playlist_item("one", "local:c:/media/one.mp3")],
-        };
-        PersistenceManager::write_playlist_state(&path, &state).unwrap();
-
-        state.revision = 2;
-        state.items = vec![playlist_item("two", "local:c:/media/two.mp3")];
-        PersistenceManager::write_playlist_state(&path, &state).unwrap();
-
-        let loaded: PlaylistStateFile =
-            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(loaded.revision, 2);
-        assert_eq!(loaded.items[0].id, "two");
+    pub fn replace_playlist(
+        &mut self,
+        expected_revision: u64,
+        mut items: Vec<PlaylistItem>,
+    ) -> Result<StoredPlaylist, String> {
+        let mut ids = HashSet::new();
+        let mut keys = HashSet::new();
+        for item in &items {
+            if item.id.trim().is_empty()
+                || item.media_id.trim().is_empty()
+                || item.canonical_key.trim().is_empty()
+            {
+                return Err("Playlist item has no stable identity".to_string());
+            }
+            if !ids.insert(&item.id) || !keys.insert(&item.canonical_key) {
+                return Err("Playlist contains duplicate media".to_string());
+            }
+        }
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| "Playlist revision overflow".to_string())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let updated = transaction
+            .execute(
+                "UPDATE playlist_state SET revision = ?1 WHERE id = 1 AND revision = ?2",
+                params![revision, expected_revision],
+            )
+            .map_err(database_error)?;
+        if updated != 1 {
+            return Err("Playlist changed in another process; restart to reload it".to_string());
+        }
+        transaction
+            .execute("DELETE FROM playlist_entries", [])
+            .map_err(database_error)?;
+        for (position, item) in items.iter_mut().enumerate() {
+            let (origin_kind, local_path, remote_url, provider, external_id) = match &item.origin {
+                PlaylistOrigin::Local { path } => {
+                    ("local", Some(path_text(path)?), None, None, None)
+                }
+                PlaylistOrigin::Remote {
+                    url,
+                    provider,
+                    external_id,
+                } => (
+                    "remote",
+                    None,
+                    Some(url.as_str()),
+                    Some(provider.as_str()),
+                    Some(external_id.as_str()),
+                ),
+            };
+            let media_type = match item.media_type {
+                MediaType::Audio => "Audio",
+                MediaType::Video => "Video",
+            };
+            transaction
+                .execute(
+                    "INSERT INTO media (id, canonical_key, title, media_type, origin_kind,
+                     local_path, remote_url, provider, external_id, cached_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(canonical_key) DO UPDATE SET
+                     title = excluded.title, media_type = excluded.media_type,
+                     origin_kind = excluded.origin_kind, local_path = excluded.local_path,
+                     remote_url = excluded.remote_url, provider = excluded.provider,
+                     external_id = excluded.external_id, cached_path = excluded.cached_path",
+                    params![
+                        item.media_id,
+                        item.canonical_key,
+                        item.title,
+                        media_type,
+                        origin_kind,
+                        local_path,
+                        remote_url,
+                        provider,
+                        external_id,
+                        item.cached_path.as_deref().map(path_text).transpose()?
+                    ],
+                )
+                .map_err(database_error)?;
+            // Re-adding media restores its existing identity for learning references.
+            item.media_id = transaction
+                .query_row(
+                    "SELECT id FROM media WHERE canonical_key = ?1",
+                    [&item.canonical_key],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            transaction.execute(
+                "INSERT INTO playlist_entries (id, media_id, position, added_at) VALUES (?1, ?2, ?3, ?4)",
+                params![item.id, item.media_id, position, item.added_at],
+            ).map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)?;
+        Ok(StoredPlaylist { revision, items })
     }
 
-    #[test]
-    fn migration_drops_local_row_that_is_a_remote_cache_file() {
-        let cached_path = PathBuf::from("C:/cache/video.mp4");
-        let (_, local_key) = canonical_local_identity(&cached_path);
-        let mut items = vec![
-            PlaylistItem {
-                id: "local".to_string(),
-                canonical_key: local_key,
-                title: "video".to_string(),
-                media_type: MediaType::Video,
-                origin: PlaylistOrigin::Local {
-                    path: cached_path.clone(),
-                },
-                cached_path: None,
-                added_at: 1,
-            },
-            PlaylistItem {
-                id: "remote".to_string(),
-                canonical_key: "remote:youtube:video".to_string(),
-                title: "video".to_string(),
-                media_type: MediaType::Video,
-                origin: PlaylistOrigin::Remote {
-                    url: "https://youtu.be/video".to_string(),
-                    provider: "youtube".to_string(),
-                    external_id: "video".to_string(),
-                },
-                cached_path: Some(cached_path),
-                added_at: 2,
-            },
-        ];
+    pub fn load_settings(&self) -> Result<AppSettings, String> {
+        self.connection.query_row(
+            "SELECT revision, theme, language, play_mode, minimize_to_tray FROM app_settings WHERE id = 1",
+            [],
+            |row| Ok(AppSettings {
+                revision: row.get(0)?,
+                theme: row.get(1)?,
+                language: row.get(2)?,
+                play_mode: row.get(3)?,
+                minimize_to_tray: row.get(4)?,
+            }),
+        ).map_err(database_error)
+    }
 
-        PersistenceManager::remove_cached_local_duplicates(&mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, "remote");
+    pub fn save_settings(&self, settings: &AppSettings) -> Result<(), String> {
+        let previous_revision = settings
+            .revision
+            .checked_sub(1)
+            .ok_or_else(|| "Invalid settings revision".to_string())?;
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE app_settings SET revision = ?1, theme = ?2, language = ?3,
+                play_mode = ?4, minimize_to_tray = ?5 WHERE id = 1 AND revision = ?6",
+                params![
+                    settings.revision,
+                    settings.theme,
+                    settings.language,
+                    settings.play_mode,
+                    settings.minimize_to_tray,
+                    previous_revision
+                ],
+            )
+            .map_err(database_error)?;
+        if updated != 1 {
+            return Err("Settings changed in another process; restart to reload them".to_string());
+        }
+        Ok(())
     }
 }

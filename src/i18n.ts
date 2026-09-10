@@ -2,6 +2,22 @@ import { createI18n } from 'vue-i18n'
 
 const messages = {
   en: {
+    settings: {
+      title: 'Settings',
+      general: 'General',
+      savedAutomatically: 'Changes are saved automatically.',
+      loading: 'Loading settings…',
+      loadFailed: 'Unable to load settings.',
+      theme: 'Appearance',
+      themeSystem: 'System',
+      themeLight: 'Light',
+      themeDark: 'Dark',
+      language: 'Language',
+      closeToTray: 'Close to system tray',
+      closeToTrayHint: 'Keep the player running when the main window is closed.',
+      reload: 'Reload settings',
+      dismiss: 'Dismiss'
+    },
     app: {
       title: 'Drip Player'
     },
@@ -48,6 +64,22 @@ const messages = {
     }
   },
   zh: {
+    settings: {
+      title: '设置',
+      general: '通用设置',
+      savedAutomatically: '修改后自动保存。',
+      loading: '正在读取设置…',
+      loadFailed: '无法读取设置。',
+      theme: '外观',
+      themeSystem: '跟随系统',
+      themeLight: '浅色',
+      themeDark: '深色',
+      language: '界面语言',
+      closeToTray: '关闭主窗口时最小化到托盘',
+      closeToTrayHint: '关闭后继续在后台运行，可从托盘恢复窗口。',
+      reload: '重新加载设置',
+      dismiss: '关闭'
+    },
     app: {
       title: 'Drip Player'
     },
@@ -97,7 +129,7 @@ const messages = {
 
 const i18n = createI18n({
   legacy: false,
-  locale: localStorage.getItem('locale') || 'zh',
+  locale: 'zh',
   fallbackLocale: 'en',
   messages
 })

@@ -8,15 +8,18 @@ mod models;
 mod services;
 mod utils;
 
+use handlers::settings::{
+    apply_close_behavior, get_app_settings, open_settings_window, show_app_context_menu,
+    update_app_settings, SettingsWindowState, TraySettingsItem,
+};
 use models::player_state::{MusicPlayer, PlayerState};
 use models::playlist::{
     canonical_local_identity, canonical_remote_key, provider_key_for_url, LibraryItem,
-    LibrarySource, MediaType, PlaylistItem, PlaylistOrigin, PlaylistSnapshot, PlaylistStateFile,
+    LibrarySource, MediaType, PlaylistItem, PlaylistOrigin, PlaylistSnapshot,
 };
 use services::media_capabilities;
 use services::media_probe::{self, MediaInfo};
 use services::online_resolver::{OnlineResolver, VideoPlatform};
-use services::persistence::PersistenceManager;
 use services::playback_plan::{self, PlaybackPlan};
 use services::toolchain;
 use std::process::Command;
@@ -100,14 +103,16 @@ fn replace_playlist_items(
     player: &mut MusicPlayer,
     items: Vec<PlaylistItem>,
 ) -> Result<(), String> {
-    let next_revision = player.playlist_revision.saturating_add(1);
-    PersistenceManager::save_playlist_state(&PlaylistStateFile {
-        schema_version: 2,
-        revision: next_revision,
-        items: items.clone(),
-    })?;
-    player.playlist_items = items;
-    player.playlist_revision = next_revision;
+    let view_revision = player
+        .playlist_revision
+        .checked_add(1)
+        .ok_or_else(|| "Playlist view revision overflow".to_string())?;
+    let stored = player
+        .persistence
+        .replace_playlist(player.playlist_storage_revision, items)?;
+    player.playlist_items = stored.items;
+    player.playlist_storage_revision = stored.revision;
+    player.playlist_revision = view_revision;
     Ok(())
 }
 
@@ -226,6 +231,7 @@ fn build_local_playlist_item(path: &Path) -> Result<PlaylistItem, String> {
         .to_string();
     Ok(PlaylistItem {
         id: uuid::Uuid::new_v4().to_string(),
+        media_id: uuid::Uuid::new_v4().to_string(),
         canonical_key,
         title,
         media_type: media_type_for_library_path(&path),
@@ -747,6 +753,7 @@ async fn add_url_for_download(
     let media_type = metadata.get_media_type();
     let mut item = PlaylistItem {
         id: uuid::Uuid::new_v4().to_string(),
+        media_id: uuid::Uuid::new_v4().to_string(),
         canonical_key,
         title: metadata.title,
         media_type,
@@ -1494,8 +1501,8 @@ fn scan_subtitles(video_path: String) -> Vec<SubtitleInfo> {
 }
 
 fn main() {
-    let mut initial_player =
-        MusicPlayer::new().unwrap_or_else(|error| panic!("Failed to load playlist state: {error}"));
+    let mut initial_player = MusicPlayer::new()
+        .unwrap_or_else(|error| panic!("Failed to initialize application database: {error}"));
     reconcile_playlist_cache_state(&mut initial_player)
         .unwrap_or_else(|error| panic!("Failed to reconcile playlist cache: {error}"));
     let player = Arc::new(Mutex::new(initial_player));
@@ -1515,13 +1522,22 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState(player))
+        .manage(SettingsWindowState::default())
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<AppState>();
                 let player = state.0.lock().unwrap();
-                if player.minimize_to_tray {
+                if player.settings.minimize_to_tray {
                     api.prevent_close();
                     window.hide().unwrap();
+                } else if let Some(settings) = window.get_webview_window("settings") {
+                    if let Err(error) = settings.destroy() {
+                        api.prevent_close();
+                        let _ = window.emit("app-error", error.to_string());
+                    }
                 }
             }
         })
@@ -1534,7 +1550,7 @@ fn main() {
             let state_for_menu = state.clone();
 
             // 系统托盘配置
-            let initial_minimize_to_tray = state.0.lock().unwrap().minimize_to_tray;
+            let initial_minimize_to_tray = state.0.lock().unwrap().settings.minimize_to_tray;
             let quit_i = MenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
             let restore_i = MenuItem::with_id(app, "tray_restore", "恢复窗口", true, None::<&str>)?;
             let minimize_on_close_i = CheckMenuItem::with_id(
@@ -1547,6 +1563,7 @@ fn main() {
             )?;
 
             let tray_menu = Menu::with_items(app, &[&restore_i, &minimize_on_close_i, &quit_i])?;
+            app.manage(TraySettingsItem(minimize_on_close_i));
 
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
@@ -1571,7 +1588,23 @@ fn main() {
             app.on_menu_event(move |app, event| {
                 let event_id = event.id().as_ref();
 
-                if event_id == "tray_quit" {
+                if let Some(label) = event_id.strip_prefix("app_refresh:") {
+                    if let Some(window) = app.get_webview_window(label) {
+                        if let Err(error) = window.eval("window.location.reload()") {
+                            let _ = window.emit("app-error", error.to_string());
+                        }
+                    }
+                    return;
+                } else if let Some(locale) = event_id.strip_prefix("app_settings:") {
+                    let app = app.clone();
+                    let locale = locale.to_string();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = open_settings_window(app.clone(), locale).await {
+                            let _ = app.emit("app-error", error);
+                        }
+                    });
+                    return;
+                } else if event_id == "tray_quit" {
                     app.exit(0);
                 } else if event_id == "tray_restore" {
                     if let Some(window) = app.get_webview_window("main") {
@@ -1579,14 +1612,10 @@ fn main() {
                         let _ = window.set_focus();
                     }
                 } else if event_id == "tray_minimize_on_close" {
-                    let mut player = state_for_menu.0.lock().unwrap();
-                    player.minimize_to_tray = !player.minimize_to_tray;
-
-                    // 保存设置
-                    let settings = services::persistence::AppSettings {
-                        minimize_to_tray: player.minimize_to_tray,
-                    };
-                    PersistenceManager::save_settings(&settings);
+                    let enabled = !state_for_menu.0.lock().unwrap().settings.minimize_to_tray;
+                    if let Err(error) = apply_close_behavior(app, enabled) {
+                        let _ = app.emit("app-error", error);
+                    }
                 }
                 if let Some(item_id) = event_id.strip_prefix("remove_item:") {
                     let item_id = item_id.to_string();
@@ -1647,6 +1676,9 @@ fn main() {
             get_folder_tree,
             show_track_context_menu,
             show_playlist_context_menu,
+            show_app_context_menu,
+            get_app_settings,
+            update_app_settings,
             remove_track,
             clear_playlist,
             check_dependencies,
@@ -1685,6 +1717,7 @@ mod tests {
     fn playlist_item_keeps_title_when_remote_media_is_cached() {
         let item = PlaylistItem {
             id: "item-id".to_string(),
+            media_id: "media-id".to_string(),
             canonical_key: "remote:youtube:video-id".to_string(),
             title: "Logical title".to_string(),
             media_type: MediaType::Video,
@@ -1710,6 +1743,7 @@ mod tests {
     fn cache_update_targets_stable_id_after_another_item_is_removed() {
         let remote_item = |id: &str| PlaylistItem {
             id: id.to_string(),
+            media_id: format!("media-{id}"),
             canonical_key: format!("remote:youtube:{id}"),
             title: id.to_string(),
             media_type: MediaType::Video,

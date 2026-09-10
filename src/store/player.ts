@@ -1,5 +1,7 @@
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
+import { useSettingsStore, type PlayMode } from './settings'
+export type { PlayMode } from './settings'
 
 export interface LibrarySourceLocal {
   Local: {
@@ -37,6 +39,7 @@ export type PlaylistOrigin =
 
 export interface PlaylistItem {
   id: string
+  media_id: string
   canonical_key: string
   title: string
   media_type: 'Audio' | 'Video'
@@ -64,8 +67,6 @@ export interface AddUrlResult {
   item_id: string
 }
 
-export type PlayMode = 'sequential' | 'random' | 'repeat_one' | 'repeat_all'
-
 export function isSourceLocal(source: LibrarySourceLocal | LibrarySourceRemote): source is LibrarySourceLocal {
   return 'Local' in source
 }
@@ -83,8 +84,10 @@ export const usePlayerStore = defineStore('player', {
     duration: 0,
     currentItemId: null as string | null,
     currentTrack: null as ResolvedTrack | null,
-    playMode: ((localStorage.getItem('playMode') as PlayMode) || 'sequential') as PlayMode,
   }),
+  getters: {
+    playMode: (): PlayMode => useSettingsStore().data.play_mode,
+  },
   actions: {
     async loadPlaylist() {
       try {
@@ -144,9 +147,8 @@ export const usePlayerStore = defineStore('player', {
     async reportPlaybackError() {
       await invoke('on_playback_error')
     },
-    setPlayMode(mode: PlayMode) {
-      this.playMode = mode
-      localStorage.setItem('playMode', mode)
+    async setPlayMode(mode: PlayMode) {
+      return useSettingsStore().update({ play_mode: mode })
     },
     getNextItemId(): string | null {
       if (this.playlist.length === 0) return null

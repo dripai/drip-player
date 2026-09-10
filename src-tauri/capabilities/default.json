@@ -11,6 +11,8 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-show",
     "core:window:allow-hide",
+    "core:window:allow-set-title",
+    "core:window:allow-start-dragging",
     "core:window:allow-set-decorations",
     "core:menu:allow-new",
     "core:menu:allow-append",

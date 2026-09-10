@@ -3,7 +3,7 @@ use crate::models::playlist::{
     PlaylistSnapshot,
 };
 use crate::services::audio_wrapper::AudioWrapper;
-use crate::services::persistence::PersistenceManager;
+use crate::services::persistence::{AppSettings, PersistenceManager};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -31,6 +31,8 @@ pub struct MusicPlayer {
 
     pub playlist_items: Vec<PlaylistItem>,
     pub playlist_revision: u64,
+    // Database revisions exclude transient download status changes.
+    pub playlist_storage_revision: u64,
     pub current_playlist_item_id: Option<String>,
     pub downloading_item_ids: HashSet<String>,
 
@@ -44,13 +46,15 @@ pub struct MusicPlayer {
     pub temporary_item: Option<LibraryItem>,
 
     // Settings
-    pub minimize_to_tray: bool,
+    pub settings: AppSettings,
+    pub persistence: PersistenceManager,
 }
 
 impl MusicPlayer {
     pub fn new() -> Result<Self, String> {
-        let playlist_state = PersistenceManager::load_playlist_state()?;
-        let settings = PersistenceManager::load_settings();
+        let persistence = PersistenceManager::open()?;
+        let playlist_state = persistence.load_playlist()?;
+        let settings = persistence.load_settings()?;
 
         Ok(Self {
             is_playing: false,
@@ -63,6 +67,7 @@ impl MusicPlayer {
 
             playlist_items: playlist_state.items,
             playlist_revision: playlist_state.revision,
+            playlist_storage_revision: playlist_state.revision,
             current_playlist_item_id: None,
             downloading_item_ids: HashSet::new(),
 
@@ -71,7 +76,8 @@ impl MusicPlayer {
             current_media_path: None,
             current_media_type: None,
             temporary_item: None,
-            minimize_to_tray: settings.minimize_to_tray,
+            settings,
+            persistence,
         })
     }
 
@@ -95,6 +101,7 @@ impl MusicPlayer {
                 };
                 PlaylistItemView {
                     id: item.id.clone(),
+                    media_id: item.media_id.clone(),
                     canonical_key: item.canonical_key.clone(),
                     title: item.title.clone(),
                     media_type: item.media_type.clone(),

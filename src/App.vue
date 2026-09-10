@@ -8,13 +8,12 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { check } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { Moon, Sun, PanelRightOpen, PanelRightClose, Minus, Square, X, Languages } from 'lucide-vue-next'
-import { useDark, useToggle } from '@vueuse/core'
+import { useSettingsStore } from './store/settings'
 import { useI18n } from 'vue-i18n'
 
 const appWindow = getCurrentWindow()
 const store = usePlayerStore()
-const isDark = useDark()
-const toggleDark = useToggle(isDark)
+const settings = useSettingsStore()
 const { locale } = useI18n()
 
 const sidebarVisible = ref(true)
@@ -30,8 +29,11 @@ function toggleSidebar() {
 }
 
 function toggleLanguage() {
-  locale.value = locale.value === 'zh' ? 'en' : 'zh'
-  localStorage.setItem('locale', locale.value)
+  void settings.update({ language: locale.value === 'zh' ? 'en' : 'zh' })
+}
+
+function toggleDark() {
+  void settings.update({ theme: settings.isDark ? 'light' : 'dark' })
 }
 
 function startResize(e: MouseEvent) {
@@ -176,11 +178,11 @@ onUnmounted(() => {
           <PanelRightClose v-if="sidebarVisible" class="w-5 h-5" />
           <PanelRightOpen v-else class="w-5 h-5" />
         </button>
-        <button @click="toggleDark()" class="no-drag p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
-          <Moon v-if="!isDark" class="w-5 h-5" />
+        <button @click="toggleDark()" :disabled="settings.saving" class="no-drag p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
+          <Moon v-if="!settings.isDark" class="w-5 h-5" />
           <Sun v-else class="w-5 h-5" />
         </button>
-        <button @click="toggleLanguage" class="no-drag p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors" :title="locale === 'zh' ? 'Switch to English' : '切换到中文'">
+        <button @click="toggleLanguage" :disabled="settings.saving" class="no-drag p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors" :title="locale === 'zh' ? 'Switch to English' : '切换到中文'">
           <Languages class="w-5 h-5" />
         </button>
         <div class="flex items-center ml-2">

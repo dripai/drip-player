@@ -25,6 +25,10 @@ Drip Player is a Tauri 2, Vue 3, and Rust desktop media player for local course 
 - Online media: resolve and download online videos through `yt-dlp`.
 - Subtitle discovery: automatically scans sibling `.srt`, `.vtt`, `.ass`, and `.ssa` files.
 - Desktop experience: dark mode, custom title bar, playback controls, volume, playback rate, subtitles, and sidebar.
+- Page context menu: refresh the current window or open a separate settings window; playlist removal and clear menus remain available.
+- General settings: appearance (system, light, dark), interface language, and close to system tray, saved automatically.
+- The settings window has a theme-aware custom title bar with dragging and an independent close button.
+- SQLite storage for playlists, media metadata, appearance, language, play mode, and close-to-tray settings.
 
 ## Media Format Strategy
 
@@ -154,10 +158,13 @@ drip-player/
 
 ## Runtime Data
 
+The database is stored at `config/drip-player.sqlite3` beside the executable. First launch starts with an empty playlist and default settings. Old JSON and browser settings are not imported, and old files are not deleted. Removing playlist entries keeps media metadata and files. See [SQLite storage notes](docs/sqlite-storage.md).
+
 The following directories are ignored by Git:
 
 - `lib/`: bundled tools downloaded during builds; local binary files are not committed.
 - `cache/`: runtime cache.
+- `config/`: SQLite database and runtime configuration.
 - `downloads/`: downloaded media files.
 - `doc/`: local design notes or private documentation.
 

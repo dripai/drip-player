@@ -1,6 +1,6 @@
 {
-  "productName": "Shadow Player",
-  "version": "1.0.7",
+  "productName": "ShadowPlayer",
+  "version": "1.0.8",
   "identifier": "com.shadow.player",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -30,6 +30,11 @@
   },
   "bundle": {
     "macOS": { "entitlements": "Entitlements.plist" },
+    "windows": {
+      "wix": {
+        "upgradeCode": "51c3c796-888a-5e52-aecd-76eed5f91340"
+      }
+    },
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
